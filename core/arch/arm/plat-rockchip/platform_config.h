@@ -115,6 +115,17 @@
 #define TRNG_S_BASE		0xfe398000
 #define TRNG_S_SIZE		SIZE_K(32)
 
+#define NPU_BASE		0xfdab0000
+#define NPU1_BASE		0xfdac0000
+#define NPU2_BASE		0xfdad0000
+#define NPU_SIZE		SIZE_K(64)
+
+#define BUSSGRF_BASE		0xfd586000
+#define BUSSGRF_SIZE		SIZE_K(4)
+
+#define CRU_BASE		0xfd7c0000
+#define CRU_SIZE		SIZE_K(4)
+
 #define OTP_S_BASE		0xfe3a0000
 #define OTP_S_SIZE		SIZE_K(64)
 

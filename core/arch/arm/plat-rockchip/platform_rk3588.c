@@ -55,6 +55,11 @@
 register_phys_mem_pgdir(MEM_AREA_IO_SEC, FIREWALL_DDR_BASE, FIREWALL_DDR_SIZE);
 register_phys_mem_pgdir(MEM_AREA_IO_SEC, FIREWALL_DSU_BASE, FIREWALL_DSU_SIZE);
 register_phys_mem_pgdir(MEM_AREA_IO_SEC, TRNG_S_BASE, TRNG_S_SIZE);
+register_phys_mem(MEM_AREA_IO_SEC, NPU_BASE, NPU_SIZE);
+register_phys_mem(MEM_AREA_IO_SEC, NPU1_BASE, NPU_SIZE);
+register_phys_mem(MEM_AREA_IO_SEC, NPU2_BASE, NPU_SIZE);
+register_phys_mem(MEM_AREA_IO_SEC, BUSSGRF_BASE, BUSSGRF_SIZE);
+register_phys_mem(MEM_AREA_IO_SEC, CRU_BASE, CRU_SIZE);
 
 static struct mutex trng_mutex = MUTEX_INITIALIZER;
 static struct mutex huk_mutex = MUTEX_INITIALIZER;
