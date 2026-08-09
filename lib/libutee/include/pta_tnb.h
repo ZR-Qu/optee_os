@@ -7,7 +7,7 @@
 #define PTA_TNB_UUID { 0x0ea88044, 0x846a, 0x47a2, \
 	{ 0x87, 0xff, 0xc1, 0xb7, 0x20, 0xf0, 0x69, 0x4e } }
 
-#define PTA_TNB_ABI_VERSION 12
+#define PTA_TNB_ABI_VERSION 16
 #define PTA_TNB_BUILD_ID 0x49505431u
 
 #define PTA_TNB_CMD_GET_CAPS 0
@@ -20,6 +20,9 @@
 #define PTA_TNB_CMD_REPREPARE 7
 #define PTA_TNB_CMD_PREPARE_MULTI 8
 #define PTA_TNB_CMD_REPREPARE_MULTI 9
+#define PTA_TNB_CMD_PREPARE_FFN_SLOT 10
+#define PTA_TNB_CMD_PREPARE_MULTI_SLOT 11
+#define PTA_TNB_CMD_REPREPARE_MULTI_SLOT 12
 
 #define PTA_TNB_PREPARE_FLAG_SECURE_PTE (1u << 0)
 #define PTA_TNB_PREPARE_FLAG_FULL_SECURITY (1u << 1)
@@ -142,6 +145,8 @@ enum pta_tnb_debug_index {
 #define PTA_TNB_CAP_MULTI_CORE (1u << 10)
 #define PTA_TNB_CAP_STALLED_WEIGHT_REMAP (1u << 11)
 #define PTA_TNB_CAP_FIXED_WEIGHT_PTES (1u << 12)
+#define PTA_TNB_CAP_PROFILE (1u << 13)
+#define PTA_TNB_CAP_FFN_WEIGHT_SLOTS (1u << 14)
 
 #define PTA_TNB_USER_TA_UUID { 0x96d83ee6, 0x5ca4, 0x427e, \
 	{ 0xb3, 0xea, 0x90, 0xa7, 0x85, 0xd2, 0xe8, 0xa3 } }
@@ -152,6 +157,10 @@ enum pta_tnb_debug_index {
 #define PTA_TNB_MAX_SECURE_WEIGHT_SIZE 4096
 #define PTA_TNB_MAX_WEIGHT_SIZE 12582912
 #define PTA_TNB_MAX_OUTPUT_SIZE 24576
+#define PTA_TNB_FFN_WEIGHT_SLOT_COUNT 3
+#define PTA_TNB_FFN_WEIGHT_SLOT_GATE 0
+#define PTA_TNB_FFN_WEIGHT_SLOT_UP 1
+#define PTA_TNB_FFN_WEIGHT_SLOT_DOWN 2
 
 #define PTA_TNB_STATE_READY 0
 #define PTA_TNB_STATE_PREPARED 1
@@ -226,6 +235,48 @@ struct pta_tnb_prepare_multi {
 	struct pta_tnb_segment segment[PTA_TNB_MAX_CORES];
 };
 
+struct pta_tnb_ffn_slot {
+	uint32_t abi_version;
+	uint32_t flags;
+	uint32_t weight_size;
+	uint32_t weight_cookie;
+	uint32_t weight_slot;
+	uint32_t reserved[3];
+};
+
+struct pta_tnb_prepare_multi_slot {
+	struct pta_tnb_prepare_multi prepare;
+	uint32_t weight_slot;
+	uint32_t reserved[3];
+};
+
+#define PTA_TNB_PROFILE_VERSION 1
+
+struct pta_tnb_profile {
+	uint32_t version;
+	uint32_t counter_frequency;
+	uint64_t prepare_calls;
+	uint64_t prepare_ticks;
+	uint64_t reprepare_calls;
+	uint64_t reprepare_ticks;
+	uint64_t activate_calls;
+	uint64_t activate_ticks;
+	uint64_t run_calls;
+	uint64_t run_ticks;
+	uint64_t poll_calls;
+	uint64_t poll_ticks;
+	uint64_t close_calls;
+	uint64_t close_ticks;
+	uint64_t weight_remap_calls;
+	uint64_t weight_remap_ticks;
+	uint64_t slot_prepare_calls;
+	uint64_t slot_prepare_ticks;
+	uint64_t slot_prepare_cold_calls;
+	uint64_t slot_prepare_cached_calls;
+	uint64_t slot_repatch_calls;
+	uint64_t slot_repatch_ticks;
+};
+
 struct pta_tnb_status {
 	uint32_t abi_version;
 	uint32_t state;
@@ -238,6 +289,7 @@ struct pta_tnb_status {
 	uint32_t debug[PTA_TNB_DEBUG_WORDS];
 	struct pta_tnb_trace last_success;
 	struct pta_tnb_trace failure;
+	struct pta_tnb_profile profile;
 };
 
 #endif
