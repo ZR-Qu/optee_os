@@ -7,7 +7,7 @@
 #define PTA_TNB_UUID { 0x0ea88044, 0x846a, 0x47a2, \
 	{ 0x87, 0xff, 0xc1, 0xb7, 0x20, 0xf0, 0x69, 0x4e } }
 
-#define PTA_TNB_ABI_VERSION 16
+#define PTA_TNB_ABI_VERSION 20
 #define PTA_TNB_BUILD_ID 0x49505431u
 
 #define PTA_TNB_CMD_GET_CAPS 0
@@ -23,6 +23,9 @@
 #define PTA_TNB_CMD_PREPARE_FFN_SLOT 10
 #define PTA_TNB_CMD_PREPARE_MULTI_SLOT 11
 #define PTA_TNB_CMD_REPREPARE_MULTI_SLOT 12
+#define PTA_TNB_CMD_PREPARE_FFN_SLOT_SET 13
+#define PTA_TNB_CMD_EXEC_MULTI_SLOT_CHAIN 14
+#define PTA_TNB_CMD_SELECT_FFN_SLOT_SET 15
 
 #define PTA_TNB_PREPARE_FLAG_SECURE_PTE (1u << 0)
 #define PTA_TNB_PREPARE_FLAG_FULL_SECURITY (1u << 1)
@@ -147,20 +150,40 @@ enum pta_tnb_debug_index {
 #define PTA_TNB_CAP_FIXED_WEIGHT_PTES (1u << 12)
 #define PTA_TNB_CAP_PROFILE (1u << 13)
 #define PTA_TNB_CAP_FFN_WEIGHT_SLOTS (1u << 14)
+#define PTA_TNB_CAP_MULTI_SLOT_CHAIN (1u << 15)
+#define PTA_TNB_CAP_CACHED_FFN_SLOT_SET (1u << 16)
+#define PTA_TNB_CAP_FUSED_SELECT_CHAIN (1u << 17)
 
 #define PTA_TNB_USER_TA_UUID { 0x96d83ee6, 0x5ca4, 0x427e, \
 	{ 0xb3, 0xea, 0x90, 0xa7, 0x85, 0xd2, 0xe8, 0xa3 } }
 
+#define PTA_TNB_LAYER_TA_UUID { 0x8aaaf200, 0x2450, 0x4d0e, \
+	{ 0x8f, 0x0b, 0x2b, 0x55, 0x56, 0x6d, 0x11, 0x01 } }
+
 #define PTA_TNB_MAX_COMMANDS 128
 #define PTA_TNB_COMMAND_TRAILER_COUNT 4
 #define PTA_TNB_MAX_INPUT_SIZE 8192
+#define PTA_TNB_MAX_BATCH_INPUT_SIZE 55296
 #define PTA_TNB_MAX_SECURE_WEIGHT_SIZE 4096
 #define PTA_TNB_MAX_WEIGHT_SIZE 12582912
 #define PTA_TNB_MAX_OUTPUT_SIZE 24576
+#define PTA_TNB_MAX_BATCH_OUTPUT_SIZE 221184
 #define PTA_TNB_FFN_WEIGHT_SLOT_COUNT 3
 #define PTA_TNB_FFN_WEIGHT_SLOT_GATE 0
 #define PTA_TNB_FFN_WEIGHT_SLOT_UP 1
 #define PTA_TNB_FFN_WEIGHT_SLOT_DOWN 2
+#define PTA_TNB_CHAIN_MAX_JOBS 2
+#define PTA_TNB_CHAIN_MAX_ROWS 10
+#define PTA_TNB_MULTI_COMMAND_WORDS \
+	(PTA_TNB_MAX_CORES * \
+	 (PTA_TNB_MAX_COMMANDS + PTA_TNB_COMMAND_TRAILER_COUNT))
+
+#define PTA_TNB_CHAIN_FLAG_BEGIN (1u << 0)
+#define PTA_TNB_CHAIN_FLAG_END (1u << 1)
+#define PTA_TNB_CHAIN_FLAG_SELECT_FFN_SLOT_SET (1u << 2)
+#define PTA_TNB_CHAIN_FLAGS_MASK \
+	(PTA_TNB_CHAIN_FLAG_BEGIN | PTA_TNB_CHAIN_FLAG_END | \
+	 PTA_TNB_CHAIN_FLAG_SELECT_FFN_SLOT_SET)
 
 #define PTA_TNB_STATE_READY 0
 #define PTA_TNB_STATE_PREPARED 1
@@ -250,7 +273,23 @@ struct pta_tnb_prepare_multi_slot {
 	uint32_t reserved[3];
 };
 
-#define PTA_TNB_PROFILE_VERSION 1
+struct pta_tnb_ffn_slot_set {
+	uint32_t abi_version;
+	uint32_t flags;
+	uint32_t weight_size;
+	uint32_t reserved;
+	uint32_t weight_cookie[PTA_TNB_FFN_WEIGHT_SLOT_COUNT];
+	uint32_t reserved2[5];
+};
+
+struct pta_tnb_chain_job {
+	struct pta_tnb_prepare_multi_slot request;
+	uint32_t command_words;
+	uint32_t reserved[3];
+	uint64_t commands[PTA_TNB_MULTI_COMMAND_WORDS];
+};
+
+#define PTA_TNB_PROFILE_VERSION 4
 
 struct pta_tnb_profile {
 	uint32_t version;
@@ -275,6 +314,16 @@ struct pta_tnb_profile {
 	uint64_t slot_prepare_cached_calls;
 	uint64_t slot_repatch_calls;
 	uint64_t slot_repatch_ticks;
+	uint64_t slot_set_calls;
+	uint64_t slot_set_ticks;
+	uint64_t slot_select_calls;
+	uint64_t slot_select_ticks;
+	uint64_t fused_slot_select_calls;
+	uint64_t fused_slot_select_ticks;
+	uint64_t chain_calls;
+	uint64_t chain_ticks;
+	uint64_t chain_jobs;
+	uint64_t chain_rows;
 };
 
 struct pta_tnb_status {
@@ -290,6 +339,20 @@ struct pta_tnb_status {
 	struct pta_tnb_trace last_success;
 	struct pta_tnb_trace failure;
 	struct pta_tnb_profile profile;
+};
+
+struct pta_tnb_multi_slot_chain {
+	uint32_t abi_version;
+	uint32_t flags;
+	uint32_t job_count;
+	uint32_t rows;
+	uint32_t failed_job;
+	uint32_t failed_row;
+	uint32_t result;
+	uint32_t select_weight_cookie[PTA_TNB_FFN_WEIGHT_SLOT_COUNT];
+	uint32_t reserved[2];
+	struct pta_tnb_status status;
+	struct pta_tnb_chain_job job[PTA_TNB_CHAIN_MAX_JOBS];
 };
 
 #endif

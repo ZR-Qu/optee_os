@@ -101,9 +101,12 @@
 #define TNB_TIMEOUT_US 100000
 #define TNB_PAGE_TABLE_COUNT 12
 #define TNB_FFN_WEIGHT_CACHE_COUNT 84
-#define TNB_INPUT_STORAGE_SIZE PTA_TNB_MAX_INPUT_SIZE
+#define TNB_FFN_WEIGHT_PTE_TABLE_COUNT 3
+#define TNB_LEGACY_INPUT_STORAGE_SIZE 8192
+#define TNB_LEGACY_OUTPUT_STORAGE_SIZE 24576
+#define TNB_INPUT_STORAGE_SIZE 57344
 #define TNB_WEIGHT_STORAGE_SIZE PTA_TNB_MAX_SECURE_WEIGHT_SIZE
-#define TNB_OUTPUT_STORAGE_SIZE PTA_TNB_MAX_OUTPUT_SIZE
+#define TNB_OUTPUT_STORAGE_SIZE PTA_TNB_MAX_BATCH_OUTPUT_SIZE
 
 #define TNB_COMMAND_TAG(entry) ((uint16_t)((entry) >> 48))
 #define TNB_COMMAND_VALUE(entry) ((uint32_t)((entry) >> 16))
@@ -135,9 +138,16 @@ struct tnb_mmu_save {
 	bool paging;
 };
 
+struct tnb_cached_weight {
+	struct mobj *mobj;
+	size_t mobj_offset;
+	uint64_t signature;
+	bool pte_valid;
+	uint32_t page_table[TNB_FFN_WEIGHT_PTE_TABLE_COUNT][TNB_PT_ENTRIES];
+};
+
 struct tnb_session {
-	uint64_t ffn_weight_signature[TNB_FFN_WEIGHT_CACHE_COUNT];
-	uint32_t ffn_weight_valid[3];
+	struct tnb_cached_weight ffn_weight[TNB_FFN_WEIGHT_CACHE_COUNT];
 };
 
 struct tnb_dev {
@@ -162,6 +172,8 @@ struct tnb_dev {
 	uint32_t input_size;
 	uint32_t weight_size;
 	uint32_t output_size;
+	uint32_t input_mapping_size;
+	uint32_t output_mapping_size;
 	uint32_t template_id;
 	uint32_t weight_cookie;
 	void *weight_buffer;
@@ -209,6 +221,8 @@ static const uint64_t command_trailer[PTA_TNB_COMMAND_TRAILER_COUNT] = {
 static struct tnb_dev dev;
 static struct pta_tnb_profile profile;
 static struct mutex lock = MUTEX_INITIALIZER;
+
+static TEE_Result close_device(void *session, uint32_t types);
 
 static uint64_t profile_now(void)
 {
@@ -551,9 +565,11 @@ static bool prepare_ffn_page_tables(void)
 	    !install_page_table(TNB_IOVA_WEIGHT_SLOT(2) + SIZE_M(8)) ||
 	    !map_buffer(TNB_IOVA_CMD, command_buffer(0),
 			dev.core_count * TNB_PAGE_SIZE, TNB_PTE_READ, true) ||
-	    !map_buffer(TNB_IOVA_INPUT, input_pages, sizeof(input_pages),
+	    !map_buffer(TNB_IOVA_INPUT, input_pages,
+			TNB_LEGACY_INPUT_STORAGE_SIZE,
 			TNB_PTE_READ, true) ||
-	    !map_buffer(TNB_IOVA_OUTPUT, output_pages, sizeof(output_pages),
+	    !map_buffer(TNB_IOVA_OUTPUT, output_pages,
+			TNB_LEGACY_OUTPUT_STORAGE_SIZE,
 			TNB_PTE_READ | TNB_PTE_WRITE, true))
 		return false;
 
@@ -566,6 +582,42 @@ static bool prepare_ffn_page_tables(void)
 		page_table_for_iova(TNB_IOVA_INPUT)[pte_index(TNB_IOVA_INPUT)];
 	dev.debug[PTA_TNB_DEBUG_PTE_OUTPUT] =
 		page_table_for_iova(TNB_IOVA_OUTPUT)[pte_index(TNB_IOVA_OUTPUT)];
+	dev.input_mapping_size = TNB_LEGACY_INPUT_STORAGE_SIZE;
+	dev.output_mapping_size = TNB_LEGACY_OUTPUT_STORAGE_SIZE;
+	return true;
+}
+
+static bool ensure_ffn_io_page_tables(size_t input_size, size_t output_size)
+{
+	uint32_t *input_table = page_table_for_iova(TNB_IOVA_INPUT);
+	uint32_t *output_table = page_table_for_iova(TNB_IOVA_OUTPUT);
+	size_t input_mapping_size = input_size;
+	size_t output_mapping_size = output_size;
+
+	if (!input_size || input_size > sizeof(input_pages) || !output_size ||
+	    output_size > sizeof(output_pages) || !input_table || !output_table)
+		return false;
+	/* The down job can require more input pages while the FFN chain is active. */
+	if (input_size > TNB_LEGACY_INPUT_STORAGE_SIZE ||
+	    output_size > TNB_LEGACY_OUTPUT_STORAGE_SIZE) {
+		input_mapping_size = sizeof(input_pages);
+		output_mapping_size = sizeof(output_pages);
+	}
+	if (input_mapping_size > dev.input_mapping_size) {
+		if (!map_buffer(TNB_IOVA_INPUT, input_pages, input_mapping_size,
+				TNB_PTE_READ, true))
+			return false;
+		dcache_clean_range(input_table, sizeof(page_tables[0]));
+		dev.input_mapping_size = input_mapping_size;
+	}
+	if (output_mapping_size > dev.output_mapping_size) {
+		if (!map_buffer(TNB_IOVA_OUTPUT, output_pages, output_mapping_size,
+				TNB_PTE_READ | TNB_PTE_WRITE, true))
+			return false;
+		dcache_clean_range(output_table, sizeof(page_tables[0]));
+		dev.output_mapping_size = output_mapping_size;
+	}
+	dsb();
 	return true;
 }
 
@@ -630,6 +682,47 @@ static bool prepare_ffn_weight_slot(size_t slot, uint32_t weight_cookie,
 	dev.debug[PTA_TNB_DEBUG_PTE_WEIGHT] =
 		page_table_for_iova(iova)[pte_index(iova)];
 	*signature = value;
+	return true;
+}
+
+static bool cache_ffn_weight_slot(struct tnb_cached_weight *cached,
+				  size_t slot)
+{
+	uint32_t iova = TNB_IOVA_WEIGHT_SLOT(slot);
+	size_t n = 0;
+
+	if (!cached || slot >= PTA_TNB_FFN_WEIGHT_SLOT_COUNT)
+		return false;
+	for (n = 0; n < TNB_FFN_WEIGHT_PTE_TABLE_COUNT; ++n) {
+		uint32_t *table = page_table_for_iova(iova + n * SIZE_M(4));
+
+		if (!table)
+			return false;
+		memcpy(cached->page_table[n], table, sizeof(cached->page_table[n]));
+	}
+	cached->pte_valid = true;
+	return true;
+}
+
+static bool install_cached_ffn_weight_slot(
+		const struct tnb_cached_weight *cached, size_t slot)
+{
+	uint32_t iova = TNB_IOVA_WEIGHT_SLOT(slot);
+	size_t n = 0;
+
+	if (!cached || !cached->pte_valid ||
+	    slot >= PTA_TNB_FFN_WEIGHT_SLOT_COUNT)
+		return false;
+	for (n = 0; n < TNB_FFN_WEIGHT_PTE_TABLE_COUNT; ++n) {
+		uint32_t *table = page_table_for_iova(iova + n * SIZE_M(4));
+
+		if (!table)
+			return false;
+		memcpy(table, cached->page_table[n], sizeof(cached->page_table[n]));
+		dcache_clean_range(table, sizeof(cached->page_table[n]));
+	}
+	dev.debug[PTA_TNB_DEBUG_PTE_WEIGHT] =
+		page_table_for_iova(iova)[pte_index(iova)];
 	return true;
 }
 
@@ -720,6 +813,14 @@ static bool validate_template(const struct pta_tnb_prepare *request,
 
 static void clear_work(void)
 {
+	size_t input_clear_size = dev.input_size >
+		TNB_LEGACY_INPUT_STORAGE_SIZE ? sizeof(input_pages) :
+		TNB_LEGACY_INPUT_STORAGE_SIZE;
+	size_t output_clear_size = dev.input_size >
+		TNB_LEGACY_INPUT_STORAGE_SIZE || dev.output_size >
+		TNB_LEGACY_OUTPUT_STORAGE_SIZE ? sizeof(output_pages) :
+		TNB_LEGACY_OUTPUT_STORAGE_SIZE;
+
 	dev.template_id = 0;
 	dev.weight_cookie = 0;
 	dev.weight_buffer = NULL;
@@ -732,17 +833,17 @@ static void clear_work(void)
 	    !command_page_is_uncached)
 		memset(uncached_command_page, 0,
 		       PTA_TNB_MAX_CORES * TNB_PAGE_SIZE);
-	memset(input_pages, 0, sizeof(input_pages));
+	memset(input_pages, 0, input_clear_size);
 	memset(weight_page, 0, sizeof(weight_page));
-	memset(output_pages, 0, sizeof(output_pages));
+	memset(output_pages, 0, output_clear_size);
 	memset(directory_table, 0, sizeof(directory_table));
 	memset(page_tables, 0, sizeof(page_tables));
 	memset(alternate_weight_page_tables, 0,
 	       sizeof(alternate_weight_page_tables));
 	dcache_clean_range(cached_command_page, sizeof(cached_command_page));
-	dcache_clean_range(input_pages, sizeof(input_pages));
+	dcache_clean_range(input_pages, input_clear_size);
 	dcache_clean_range(weight_page, sizeof(weight_page));
-	dcache_clean_range(output_pages, sizeof(output_pages));
+	dcache_clean_range(output_pages, output_clear_size);
 	dcache_clean_range(directory_table, sizeof(directory_table));
 	dcache_clean_range(page_tables, sizeof(page_tables));
 	dcache_clean_range(alternate_weight_page_tables,
@@ -1342,8 +1443,11 @@ static TEE_Result get_caps(uint32_t types, TEE_Param params[TEE_NUM_PARAMS])
 				    PTA_TNB_CAP_MULTI_CORE |
 				    PTA_TNB_CAP_STALLED_WEIGHT_REMAP |
 				    PTA_TNB_CAP_FIXED_WEIGHT_PTES |
-				    PTA_TNB_CAP_PROFILE |
-				    PTA_TNB_CAP_FFN_WEIGHT_SLOTS,
+			    PTA_TNB_CAP_PROFILE |
+			    PTA_TNB_CAP_FFN_WEIGHT_SLOTS |
+			    PTA_TNB_CAP_MULTI_SLOT_CHAIN |
+			    PTA_TNB_CAP_CACHED_FFN_SLOT_SET |
+			    PTA_TNB_CAP_FUSED_SELECT_CHAIN,
 		.max_templates = 1,
 		.max_tensors = 3,
 		.reserved = { PTA_TNB_BUILD_ID },
@@ -1416,10 +1520,10 @@ static bool validate_multi_request(const struct pta_tnb_prepare_multi *request,
 	    !request->template_id ||
 	    request->core_count != PTA_TNB_MAX_CORES ||
 	    !request->input_size ||
-	    request->input_size > PTA_TNB_MAX_INPUT_SIZE ||
+	    request->input_size > PTA_TNB_MAX_BATCH_INPUT_SIZE ||
 	    request->weight_size != PTA_TNB_MAX_WEIGHT_SIZE ||
 	    !request->output_size ||
-	    request->output_size > PTA_TNB_MAX_OUTPUT_SIZE ||
+	    request->output_size > PTA_TNB_MAX_BATCH_OUTPUT_SIZE ||
 	    (request->flags & required_flags) != required_flags ||
 	    (request->flags & ~(required_flags |
 			       PTA_TNB_PREPARE_FLAG_TRACE_STEPS)) ||
@@ -1572,15 +1676,15 @@ static bool load_job_multi_slot(
 		dev.ffn_weight_cookie[request->weight_slot] ||
 		request->prepare.weight_size != PTA_TNB_MAX_WEIGHT_SIZE)
 		return false;
-	memset(command_buffer(0), 0, PTA_TNB_MAX_CORES * TNB_PAGE_SIZE);
-	memset(input_pages, 0, sizeof(input_pages));
-	memset(output_pages, 0, sizeof(output_pages));
 	dev.core_count = PTA_TNB_MAX_CORES;
 	dev.multi_core = true;
 	dev.nonsecure_weight = true;
 	dev.pte_flags =
 		(request->prepare.flags & PTA_TNB_PREPARE_FLAG_SECURE_PTE) ?
 		TNB_PTE_SECURE : 0;
+	if (!ensure_ffn_io_page_tables(request->prepare.input_size,
+				       request->prepare.output_size))
+		return false;
 	dev.input_size = request->prepare.input_size;
 	dev.weight_size = request->prepare.weight_size;
 	dev.output_size = request->prepare.output_size;
@@ -1640,8 +1744,7 @@ static bool load_job_multi_slot(
 	if (!(request->prepare.flags & PTA_TNB_PREPARE_FLAG_UNCACHED_COMMAND))
 		dcache_clean_range(cached_command_page,
 				   sizeof(cached_command_page));
-	dcache_clean_range(input_pages, sizeof(input_pages));
-	dcache_clean_range(output_pages, sizeof(output_pages));
+	dcache_clean_range(input_pages, request->prepare.input_size);
 	dsb();
 	dev.ffn_job_loaded = true;
 	return true;
@@ -2084,25 +2187,21 @@ out:
 	return res;
 }
 
-static TEE_Result prepare_ffn_slot(void *session, uint32_t types,
-				   TEE_Param params[TEE_NUM_PARAMS])
+static TEE_Result prepare_ffn_slot_mobj(
+	void *session, const struct pta_tnb_ffn_slot *request,
+	struct mobj *weight_mobj, size_t weight_mobj_offset,
+	void *weight_buffer, bool update_cache)
 {
-	const struct pta_tnb_ffn_slot *request = NULL;
 	struct tnb_session *tnb_session = session;
-	struct mobj *weight_mobj = NULL;
-	TEE_Result res = validate_ffn_slot_params(types, params, &request);
+	struct tnb_cached_weight *cached = NULL;
+	TEE_Result res = TEE_SUCCESS;
 	uint64_t profile_start = profile_now();
 	uint64_t weight_signature = 0;
-	size_t weight_mobj_offset = 0;
 	size_t cache_index = 0;
 	size_t n = 0;
 
-	if (res)
-		return res;
-	if (!tnb_session ||
-	    request->weight_cookie > TNB_FFN_WEIGHT_CACHE_COUNT ||
-	    !caller_buffer_mobj(params[1].memref.buffer, request->weight_size,
-				&weight_mobj, &weight_mobj_offset))
+	if (!tnb_session || !request || !weight_mobj ||
+	    request->weight_cookie > TNB_FFN_WEIGHT_CACHE_COUNT)
 		return TEE_ERROR_BAD_PARAMETERS;
 	mutex_lock(&lock);
 	if (dev.state == PTA_TNB_STATE_LOCKED) {
@@ -2120,9 +2219,9 @@ static TEE_Result prepare_ffn_slot(void *session, uint32_t types,
 		dev.core_count = PTA_TNB_MAX_CORES;
 		dev.multi_core = true;
 		dev.nonsecure_weight = true;
-		dev.input_size = PTA_TNB_MAX_INPUT_SIZE;
+		dev.input_size = PTA_TNB_MAX_BATCH_INPUT_SIZE;
 		dev.weight_size = PTA_TNB_MAX_WEIGHT_SIZE;
-		dev.output_size = PTA_TNB_MAX_OUTPUT_SIZE;
+		dev.output_size = PTA_TNB_MAX_BATCH_OUTPUT_SIZE;
 		if (!init_uncached_command_page() ||
 		    !set_command_page_uncached(false) ||
 		    !prepare_ffn_page_tables()) {
@@ -2151,23 +2250,60 @@ static TEE_Result prepare_ffn_slot(void *session, uint32_t types,
 			goto reset;
 		}
 	}
-	if (!prepare_ffn_weight_slot(request->weight_slot,
-				     request->weight_cookie, weight_mobj,
-				     weight_mobj_offset, request->weight_size,
-				     &weight_signature)) {
-		res = TEE_ERROR_GENERIC;
-		goto reset;
-	}
 	cache_index = request->weight_cookie - 1;
-	if (!(tnb_session->ffn_weight_valid[cache_index / 32] &
-	      BIT(cache_index % 32)) ||
-	    tnb_session->ffn_weight_signature[cache_index] != weight_signature) {
-		dcache_clean_range(params[1].memref.buffer, request->weight_size);
-		tnb_session->ffn_weight_signature[cache_index] = weight_signature;
-		tnb_session->ffn_weight_valid[cache_index / 32] |=
-			BIT(cache_index % 32);
-		profile.slot_prepare_cold_calls++;
+	cached = &tnb_session->ffn_weight[cache_index];
+	if (update_cache) {
+		if (!prepare_ffn_weight_slot(request->weight_slot,
+					     request->weight_cookie, weight_mobj,
+					     weight_mobj_offset,
+					     request->weight_size,
+					     &weight_signature)) {
+			res = TEE_ERROR_GENERIC;
+			goto reset;
+		}
+		if (cached->mobj != weight_mobj ||
+		    cached->mobj_offset != weight_mobj_offset ||
+		    cached->signature != weight_signature) {
+			struct mobj *new_mobj = mobj_get(weight_mobj);
+
+			if (!new_mobj) {
+				res = TEE_ERROR_OUT_OF_MEMORY;
+				goto reset;
+			}
+			if (!cache_ffn_weight_slot(cached,
+						   request->weight_slot)) {
+				mobj_put(new_mobj);
+				res = TEE_ERROR_GENERIC;
+				goto reset;
+			}
+			mobj_put(cached->mobj);
+			cached->mobj = new_mobj;
+			cached->mobj_offset = weight_mobj_offset;
+			cached->signature = weight_signature;
+			if (weight_buffer)
+				dcache_clean_range(weight_buffer,
+						   request->weight_size);
+			profile.slot_prepare_cold_calls++;
+		} else {
+			if (!cached->pte_valid &&
+			    !cache_ffn_weight_slot(cached,
+						   request->weight_slot)) {
+				res = TEE_ERROR_GENERIC;
+				goto reset;
+			}
+			profile.slot_prepare_cached_calls++;
+		}
+	} else if (cached->mobj != weight_mobj ||
+		   cached->mobj_offset != weight_mobj_offset ||
+		   !cached->pte_valid) {
+		res = TEE_ERROR_SECURITY;
+		goto reset;
 	} else {
+		if (!install_cached_ffn_weight_slot(cached,
+						    request->weight_slot)) {
+			res = TEE_ERROR_GENERIC;
+			goto reset;
+		}
 		profile.slot_prepare_cached_calls++;
 	}
 	dsb();
@@ -2185,6 +2321,161 @@ out:
 		    profile_start);
 	mutex_unlock(&lock);
 	return res;
+}
+
+static TEE_Result prepare_ffn_slot(void *session, uint32_t types,
+				   TEE_Param params[TEE_NUM_PARAMS])
+{
+	const struct pta_tnb_ffn_slot *request = NULL;
+	struct mobj *weight_mobj = NULL;
+	TEE_Result res = validate_ffn_slot_params(types, params, &request);
+	size_t weight_mobj_offset = 0;
+
+	if (res)
+		return res;
+	if (!caller_buffer_mobj(params[1].memref.buffer, request->weight_size,
+				&weight_mobj, &weight_mobj_offset))
+		return TEE_ERROR_BAD_PARAMETERS;
+	return prepare_ffn_slot_mobj(session, request, weight_mobj,
+				     weight_mobj_offset,
+				     params[1].memref.buffer, true);
+}
+
+static TEE_Result prepare_ffn_slot_set(void *session, uint32_t types,
+				       TEE_Param params[TEE_NUM_PARAMS])
+{
+	const uint32_t expected =
+		TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+				TEE_PARAM_TYPE_MEMREF_INPUT,
+				TEE_PARAM_TYPE_MEMREF_INPUT,
+				TEE_PARAM_TYPE_MEMREF_INPUT);
+	const struct pta_tnb_ffn_slot_set *request = params[0].memref.buffer;
+	TEE_Param slot_params[TEE_NUM_PARAMS] = { };
+	struct pta_tnb_ffn_slot slot = { };
+	TEE_Result res = TEE_SUCCESS;
+	uint64_t profile_start = profile_now();
+	size_t n = 0;
+	size_t m = 0;
+
+	if (types != expected || !request ||
+	    params[0].memref.size != sizeof(*request) ||
+	    request->abi_version != PTA_TNB_ABI_VERSION ||
+	    !validate_ffn_slot_flags(request->flags) ||
+	    request->weight_size != PTA_TNB_MAX_WEIGHT_SIZE ||
+	    request->reserved ||
+	    !zero_words(request->reserved2, ARRAY_SIZE(request->reserved2)))
+		return TEE_ERROR_BAD_PARAMETERS;
+	for (n = 0; n < PTA_TNB_FFN_WEIGHT_SLOT_COUNT; ++n) {
+		if (!request->weight_cookie[n] || !params[n + 1].memref.buffer ||
+		    params[n + 1].memref.size != request->weight_size ||
+		    ((vaddr_t)params[n + 1].memref.buffer &
+		     (TNB_PAGE_SIZE - 1)))
+			return TEE_ERROR_BAD_PARAMETERS;
+		for (m = 0; m < n; ++m)
+			if (request->weight_cookie[m] == request->weight_cookie[n])
+				return TEE_ERROR_BAD_PARAMETERS;
+	}
+
+	for (n = 0; n < PTA_TNB_FFN_WEIGHT_SLOT_COUNT; ++n) {
+		memset(&slot, 0, sizeof(slot));
+		memset(slot_params, 0, sizeof(slot_params));
+		slot.abi_version = PTA_TNB_ABI_VERSION;
+		slot.flags = request->flags;
+		slot.weight_size = request->weight_size;
+		slot.weight_cookie = request->weight_cookie[n];
+		slot.weight_slot = n;
+		slot_params[0].memref.buffer = &slot;
+		slot_params[0].memref.size = sizeof(slot);
+		slot_params[1] = params[n + 1];
+		res = prepare_ffn_slot(session,
+			TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+					TEE_PARAM_TYPE_MEMREF_INPUT,
+					TEE_PARAM_TYPE_NONE,
+					TEE_PARAM_TYPE_NONE), slot_params);
+		if (res)
+			break;
+	}
+	if (res)
+		(void)close_device(session,
+			TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
+					TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE));
+	mutex_lock(&lock);
+	profile_add(&profile.slot_set_calls, &profile.slot_set_ticks,
+		    profile_start);
+	mutex_unlock(&lock);
+	return res;
+}
+
+static TEE_Result select_ffn_slot_set_impl(void *session, uint32_t types,
+					   TEE_Param params[TEE_NUM_PARAMS],
+					   bool fused)
+{
+	const uint32_t expected =
+		TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+				TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
+				TEE_PARAM_TYPE_NONE);
+	const struct pta_tnb_ffn_slot_set *request = params[0].memref.buffer;
+	struct tnb_session *tnb_session = session;
+	struct pta_tnb_ffn_slot slot = { };
+	TEE_Result res = TEE_SUCCESS;
+	uint64_t profile_start = profile_now();
+	size_t cache_index = 0;
+	size_t n = 0;
+	size_t m = 0;
+
+	if (types != expected || !tnb_session || !request ||
+	    params[0].memref.size != sizeof(*request) ||
+	    request->abi_version != PTA_TNB_ABI_VERSION ||
+	    !validate_ffn_slot_flags(request->flags) ||
+	    request->weight_size != PTA_TNB_MAX_WEIGHT_SIZE || request->reserved ||
+	    !zero_words(request->reserved2, ARRAY_SIZE(request->reserved2)))
+		return TEE_ERROR_BAD_PARAMETERS;
+	for (n = 0; n < PTA_TNB_FFN_WEIGHT_SLOT_COUNT; ++n) {
+		if (!request->weight_cookie[n] ||
+		    request->weight_cookie[n] > TNB_FFN_WEIGHT_CACHE_COUNT)
+			return TEE_ERROR_BAD_PARAMETERS;
+		for (m = 0; m < n; ++m)
+			if (request->weight_cookie[m] == request->weight_cookie[n])
+				return TEE_ERROR_BAD_PARAMETERS;
+		cache_index = request->weight_cookie[n] - 1;
+		if (!tnb_session->ffn_weight[cache_index].mobj)
+			return TEE_ERROR_BAD_STATE;
+	}
+	for (n = 0; n < PTA_TNB_FFN_WEIGHT_SLOT_COUNT; ++n) {
+		struct tnb_cached_weight *cached = NULL;
+
+		cache_index = request->weight_cookie[n] - 1;
+		cached = &tnb_session->ffn_weight[cache_index];
+		memset(&slot, 0, sizeof(slot));
+		slot.abi_version = PTA_TNB_ABI_VERSION;
+		slot.flags = request->flags;
+		slot.weight_size = request->weight_size;
+		slot.weight_cookie = request->weight_cookie[n];
+		slot.weight_slot = n;
+		res = prepare_ffn_slot_mobj(session, &slot, cached->mobj,
+					     cached->mobj_offset, NULL, false);
+		if (res)
+			break;
+	}
+	if (res)
+		(void)close_device(session,
+			TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
+					TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE));
+	mutex_lock(&lock);
+	if (fused)
+		profile_add(&profile.fused_slot_select_calls,
+			    &profile.fused_slot_select_ticks, profile_start);
+	else
+		profile_add(&profile.slot_select_calls,
+			    &profile.slot_select_ticks, profile_start);
+	mutex_unlock(&lock);
+	return res;
+}
+
+static TEE_Result select_ffn_slot_set(void *session, uint32_t types,
+				      TEE_Param params[TEE_NUM_PARAMS])
+{
+	return select_ffn_slot_set_impl(session, types, params, false);
 }
 
 static TEE_Result prepare_multi_slot(void *session, uint32_t types,
@@ -2651,6 +2942,222 @@ out:
 	return res;
 }
 
+static TEE_Result exec_multi_slot_chain(void *session, uint32_t types,
+					TEE_Param params[TEE_NUM_PARAMS])
+{
+	const uint32_t one_output =
+		TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
+				TEE_PARAM_TYPE_MEMREF_INPUT,
+				TEE_PARAM_TYPE_MEMREF_OUTPUT,
+				TEE_PARAM_TYPE_NONE);
+	const uint32_t two_outputs =
+		TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
+				TEE_PARAM_TYPE_MEMREF_INPUT,
+				TEE_PARAM_TYPE_MEMREF_OUTPUT,
+				TEE_PARAM_TYPE_MEMREF_OUTPUT);
+	struct pta_tnb_multi_slot_chain *chain = params[0].memref.buffer;
+	struct pta_tnb_status run_status = { };
+	TEE_Param call_params[TEE_NUM_PARAMS] = { };
+	TEE_Result res = TEE_SUCCESS;
+	uint64_t profile_start = profile_now();
+	uint64_t completed_rows = 0;
+	size_t input_bytes = 0;
+	size_t output_bytes = 0;
+	size_t job_index = 0;
+	size_t row = 0;
+	bool first = true;
+	bool select_slots = false;
+
+	if ((types != one_output && types != two_outputs) || !chain ||
+	    params[0].memref.size != sizeof(*chain) ||
+	    chain->abi_version != PTA_TNB_ABI_VERSION ||
+	    chain->flags & ~PTA_TNB_CHAIN_FLAGS_MASK ||
+	    !chain->job_count || chain->job_count > PTA_TNB_CHAIN_MAX_JOBS ||
+	    !chain->rows || chain->rows > PTA_TNB_CHAIN_MAX_ROWS ||
+	    !zero_words(chain->reserved, ARRAY_SIZE(chain->reserved)) ||
+	    !params[1].memref.buffer ||
+	    !params[2].memref.buffer ||
+	    (chain->job_count == 1 && types != one_output) ||
+	    (chain->job_count == 2 &&
+	     (types != two_outputs || !params[3].memref.buffer)))
+		return TEE_ERROR_BAD_PARAMETERS;
+	select_slots =
+		(chain->flags & PTA_TNB_CHAIN_FLAG_SELECT_FFN_SLOT_SET) != 0;
+	if ((select_slots &&
+	     (!(chain->flags & PTA_TNB_CHAIN_FLAG_BEGIN) ||
+	      (chain->flags & PTA_TNB_CHAIN_FLAG_END) ||
+	      chain->job_count != 2)) ||
+	    (!select_slots &&
+	     !zero_words(chain->select_weight_cookie,
+			 ARRAY_SIZE(chain->select_weight_cookie))))
+		return TEE_ERROR_BAD_PARAMETERS;
+
+	for (job_index = 0; job_index < chain->job_count; ++job_index) {
+		const struct pta_tnb_chain_job *job = &chain->job[job_index];
+		const struct pta_tnb_prepare_multi *prepare = &job->request.prepare;
+		size_t command_bytes = 0;
+
+		if (!job->command_words ||
+		    job->command_words > PTA_TNB_MULTI_COMMAND_WORDS ||
+		    !zero_words(job->reserved, ARRAY_SIZE(job->reserved)) ||
+		    !zero_words(job->request.reserved,
+				ARRAY_SIZE(job->request.reserved)))
+			return TEE_ERROR_BAD_PARAMETERS;
+		command_bytes = (size_t)job->command_words * sizeof(uint64_t);
+		if (!validate_multi_request(prepare, job->commands, command_bytes) ||
+		    job->request.weight_slot >= PTA_TNB_FFN_WEIGHT_SLOT_COUNT ||
+		    (job_index && prepare->input_size !=
+				 chain->job[0].request.prepare.input_size))
+			return TEE_ERROR_BAD_PARAMETERS;
+	}
+	if (select_slots) {
+		size_t n = 0;
+		size_t m = 0;
+
+		for (n = 0; n < PTA_TNB_FFN_WEIGHT_SLOT_COUNT; ++n) {
+			if (!chain->select_weight_cookie[n] ||
+			    chain->select_weight_cookie[n] >
+				    TNB_FFN_WEIGHT_CACHE_COUNT)
+				return TEE_ERROR_BAD_PARAMETERS;
+			for (m = 0; m < n; ++m)
+				if (chain->select_weight_cookie[m] ==
+				    chain->select_weight_cookie[n])
+					return TEE_ERROR_BAD_PARAMETERS;
+		}
+		for (job_index = 0; job_index < chain->job_count; ++job_index) {
+			const struct pta_tnb_chain_job *job =
+				&chain->job[job_index];
+
+			if (job->request.prepare.weight_cookie !=
+			    chain->select_weight_cookie[job->request.weight_slot])
+				return TEE_ERROR_BAD_PARAMETERS;
+		}
+	}
+
+	input_bytes = (size_t)chain->rows *
+		chain->job[0].request.prepare.input_size;
+	if (params[1].memref.size != input_bytes)
+		return TEE_ERROR_BAD_PARAMETERS;
+	for (job_index = 0; job_index < chain->job_count; ++job_index) {
+		output_bytes = (size_t)chain->rows *
+			chain->job[job_index].request.prepare.output_size;
+		if (params[job_index + 2].memref.size != output_bytes)
+			return TEE_ERROR_BAD_PARAMETERS;
+	}
+
+	chain->failed_job = UINT32_MAX;
+	chain->failed_row = UINT32_MAX;
+	chain->result = TEE_SUCCESS;
+	memset(&chain->status, 0, sizeof(chain->status));
+	if (select_slots) {
+		struct pta_tnb_ffn_slot_set request = {
+			.abi_version = PTA_TNB_ABI_VERSION,
+			.flags = chain->job[0].request.prepare.flags,
+			.weight_size = PTA_TNB_MAX_WEIGHT_SIZE,
+		};
+
+		memcpy(request.weight_cookie, chain->select_weight_cookie,
+		       sizeof(request.weight_cookie));
+		memset(call_params, 0, sizeof(call_params));
+		call_params[0].memref.buffer = &request;
+		call_params[0].memref.size = sizeof(request);
+		res = select_ffn_slot_set_impl(session,
+			TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+					TEE_PARAM_TYPE_NONE,
+					TEE_PARAM_TYPE_NONE,
+					TEE_PARAM_TYPE_NONE),
+			call_params, true);
+		if (res)
+			goto select_fail;
+	}
+	for (job_index = 0; job_index < chain->job_count; ++job_index) {
+		struct pta_tnb_chain_job *job = &chain->job[job_index];
+		size_t command_bytes =
+			(size_t)job->command_words * sizeof(uint64_t);
+		uint8_t *output = params[job_index + 2].memref.buffer;
+
+		for (row = 0; row < chain->rows; ++row) {
+			memset(call_params, 0, sizeof(call_params));
+			call_params[0].memref.buffer = &job->request;
+			call_params[0].memref.size = sizeof(job->request);
+			call_params[1].memref.buffer = job->commands;
+			call_params[1].memref.size = command_bytes;
+			call_params[2].memref.buffer =
+				(uint8_t *)params[1].memref.buffer +
+				row * job->request.prepare.input_size;
+			call_params[2].memref.size =
+				job->request.prepare.input_size;
+			res = first && (chain->flags & PTA_TNB_CHAIN_FLAG_BEGIN) ?
+				prepare_multi_slot(session,
+					TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+							TEE_PARAM_TYPE_MEMREF_INPUT,
+							TEE_PARAM_TYPE_MEMREF_INPUT,
+							TEE_PARAM_TYPE_NONE), call_params) :
+				reprepare_multi_slot(session,
+					TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+							TEE_PARAM_TYPE_MEMREF_INPUT,
+							TEE_PARAM_TYPE_MEMREF_INPUT,
+							TEE_PARAM_TYPE_NONE), call_params);
+			if (res)
+				goto fail;
+			if (first && (chain->flags & PTA_TNB_CHAIN_FLAG_BEGIN)) {
+				res = activate(session,
+					TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
+							TEE_PARAM_TYPE_NONE,
+							TEE_PARAM_TYPE_NONE,
+							TEE_PARAM_TYPE_NONE));
+				if (res)
+					goto fail;
+			}
+			first = false;
+			memset(call_params, 0, sizeof(call_params));
+			call_params[0].memref.buffer = output +
+				row * job->request.prepare.output_size;
+			call_params[0].memref.size =
+				job->request.prepare.output_size;
+			call_params[1].memref.buffer = &run_status;
+			call_params[1].memref.size = sizeof(run_status);
+			res = run(session,
+				TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT,
+						TEE_PARAM_TYPE_MEMREF_OUTPUT,
+						TEE_PARAM_TYPE_NONE,
+						TEE_PARAM_TYPE_NONE), call_params);
+			if (res)
+				goto fail;
+			completed_rows++;
+		}
+	}
+	if (chain->flags & PTA_TNB_CHAIN_FLAG_END) {
+		res = close_device(session,
+			TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
+					TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE));
+		if (res)
+			goto fail;
+	}
+	goto out;
+
+select_fail:
+	chain->failed_job = UINT32_MAX;
+	chain->failed_row = UINT32_MAX;
+	chain->result = res;
+	goto out;
+fail:
+	chain->failed_job = job_index;
+	chain->failed_row = row;
+	chain->result = res;
+	(void)close_device(session,
+		TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
+				TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE));
+out:
+	mutex_lock(&lock);
+	profile.chain_jobs += chain->job_count;
+	profile.chain_rows += completed_rows;
+	profile_add(&profile.chain_calls, &profile.chain_ticks, profile_start);
+	fill_status(&chain->status);
+	mutex_unlock(&lock);
+	return res;
+}
+
 static TEE_Result get_status(uint32_t types,
 			     TEE_Param params[TEE_NUM_PARAMS])
 {
@@ -2702,7 +3209,8 @@ static TEE_Result lock_device(void *session, uint32_t types)
 static TEE_Result open_session(uint32_t types, TEE_Param params[TEE_NUM_PARAMS],
 			       void **session)
 {
-	const TEE_UUID allowed = PTA_TNB_USER_TA_UUID;
+	const TEE_UUID tnb_ta = PTA_TNB_USER_TA_UUID;
+	const TEE_UUID layer_ta = PTA_TNB_LAYER_TA_UUID;
 	const uint32_t expected =
 		TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
 				TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
@@ -2713,7 +3221,8 @@ static TEE_Result open_session(uint32_t types, TEE_Param params[TEE_NUM_PARAMS],
 	if (types != expected)
 		return TEE_ERROR_BAD_PARAMETERS;
 	if (caller->clnt_id.login != TEE_LOGIN_TRUSTED_APP ||
-	    memcmp(&caller->clnt_id.uuid, &allowed, sizeof(allowed)))
+	    (memcmp(&caller->clnt_id.uuid, &tnb_ta, sizeof(tnb_ta)) &&
+	     memcmp(&caller->clnt_id.uuid, &layer_ta, sizeof(layer_ta))))
 		return TEE_ERROR_ACCESS_DENIED;
 	mutex_lock(&lock);
 	memset(&profile, 0, sizeof(profile));
@@ -2728,6 +3237,9 @@ static TEE_Result open_session(uint32_t types, TEE_Param params[TEE_NUM_PARAMS],
 
 static void close_session(void *session)
 {
+	struct tnb_session *tnb_session = session;
+	size_t n = 0;
+
 	mutex_lock(&lock);
 	if (dev.owner == session && dev.state == PTA_TNB_STATE_PREPARED) {
 		if ((dev.prepare_flags & PTA_TNB_PREPARE_FLAG_UNCACHED_COMMAND) &&
@@ -2745,6 +3257,11 @@ static void close_session(void *session)
 		enter_locked(PTA_TNB_FAULT_CALLER);
 	}
 	mutex_unlock(&lock);
+	if (tnb_session)
+		for (n = 0; n < TNB_FFN_WEIGHT_CACHE_COUNT; ++n)
+			mobj_put(tnb_session->ffn_weight[n].mobj);
+	if (tnb_session)
+		memset(tnb_session, 0, sizeof(*tnb_session));
 	free(session);
 }
 
@@ -2779,6 +3296,12 @@ static TEE_Result invoke_command(void *session, uint32_t command,
 		return prepare_multi_slot(session, types, params);
 	case PTA_TNB_CMD_REPREPARE_MULTI_SLOT:
 		return reprepare_multi_slot(session, types, params);
+	case PTA_TNB_CMD_PREPARE_FFN_SLOT_SET:
+		return prepare_ffn_slot_set(session, types, params);
+	case PTA_TNB_CMD_EXEC_MULTI_SLOT_CHAIN:
+		return exec_multi_slot_chain(session, types, params);
+	case PTA_TNB_CMD_SELECT_FFN_SLOT_SET:
+		return select_ffn_slot_set(session, types, params);
 	default:
 		return TEE_ERROR_NOT_SUPPORTED;
 	}
