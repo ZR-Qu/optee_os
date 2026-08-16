@@ -212,6 +212,18 @@ static uint32_t page_tables[TNB_PAGE_TABLE_COUNT][TNB_PT_ENTRIES]
 	__aligned(TNB_PAGE_SIZE);
 static uint32_t alternate_weight_page_tables[3][TNB_PT_ENTRIES]
 	__aligned(TNB_PAGE_SIZE);
+#ifdef CFG_TNB_SECURITY_TEST
+static uint8_t secure_ram_test_page[PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE]
+	__aligned(TNB_PAGE_SIZE);
+static bool secure_ram_test_active;
+static void *secure_ram_test_owner;
+static const uint8_t secure_ram_test_pattern[TNB_PAGE_SIZE / 128] = {
+	0x4c, 0x4c, 0x4d, 0x2d, 0x54, 0x5a, 0x2d, 0x53,
+	0x45, 0x43, 0x55, 0x52, 0x45, 0x2d, 0x56, 0x31,
+	0x91, 0x27, 0xa4, 0x6e, 0x53, 0xd8, 0x0b, 0xf2,
+	0x6a, 0xc1, 0x39, 0x7d, 0xe5, 0x48, 0xb0, 0x16,
+};
+#endif
 static const uint64_t command_trailer[PTA_TNB_COMMAND_TRAILER_COUNT] = {
 	0x0000000000000000,
 	0x0101000000000014,
@@ -223,6 +235,118 @@ static struct pta_tnb_profile profile;
 static struct mutex lock = MUTEX_INITIALIZER;
 
 static TEE_Result close_device(void *session, uint32_t types);
+
+#ifdef CFG_TNB_SECURITY_TEST
+static void secure_ram_test_clear(void)
+{
+	memset(secure_ram_test_page, 0, PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE);
+	dcache_clean_range(secure_ram_test_page,
+			   PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE);
+	secure_ram_test_active = false;
+	secure_ram_test_owner = NULL;
+}
+
+static TEE_Result secure_ram_test_begin(void *session, uint32_t types,
+					TEE_Param params[TEE_NUM_PARAMS])
+{
+	struct pta_tnb_secure_ram_test_info info = { 0 };
+	paddr_t pa;
+	size_t n;
+	const uint32_t expected = TEE_PARAM_TYPES(
+		TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_NONE,
+		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+
+	if (types != expected || !params[0].memref.buffer)
+		return TEE_ERROR_BAD_PARAMETERS;
+	if (params[0].memref.size < sizeof(info)) {
+		params[0].memref.size = sizeof(info);
+		return TEE_ERROR_SHORT_BUFFER;
+	}
+
+	mutex_lock(&lock);
+	if (secure_ram_test_active || dev.state != PTA_TNB_STATE_READY) {
+		mutex_unlock(&lock);
+		return TEE_ERROR_BAD_STATE;
+	}
+	pa = virt_to_phys(secure_ram_test_page);
+	if (!pa || (pa & (TNB_PAGE_SIZE - 1)) ||
+	    !core_pbuf_is(CORE_MEM_SEC, pa,
+			   PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE)) {
+		mutex_unlock(&lock);
+		return TEE_ERROR_SECURITY;
+	}
+	for (n = 0; n < PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE; n++)
+		secure_ram_test_page[n] = secure_ram_test_pattern[
+		n % sizeof(secure_ram_test_pattern)];
+	dcache_clean_range(secure_ram_test_page,
+			   PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE);
+	secure_ram_test_active = true;
+	secure_ram_test_owner = session;
+	info.version = PTA_TNB_SECURE_RAM_TEST_VERSION;
+	info.page_size = PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE;
+	info.physical_address = (uint64_t)pa;
+	info.token = UINT64_C(0x4c4c4d545a534543);
+	memcpy(info.pattern, secure_ram_test_pattern, sizeof(info.pattern));
+	memcpy(params[0].memref.buffer, &info, sizeof(info));
+	params[0].memref.size = sizeof(info);
+	mutex_unlock(&lock);
+	return TEE_SUCCESS;
+}
+
+static TEE_Result secure_ram_test_check(void *session, uint32_t types,
+					TEE_Param params[TEE_NUM_PARAMS])
+{
+	struct pta_tnb_secure_ram_test_check check = { 0 };
+	const uint32_t expected = TEE_PARAM_TYPES(
+		TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_NONE,
+		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	size_t n;
+
+	if (types != expected || !params[0].memref.buffer)
+		return TEE_ERROR_BAD_PARAMETERS;
+	if (params[0].memref.size < sizeof(check)) {
+		params[0].memref.size = sizeof(check);
+		return TEE_ERROR_SHORT_BUFFER;
+	}
+
+	mutex_lock(&lock);
+	check.version = PTA_TNB_SECURE_RAM_TEST_VERSION;
+	check.active = secure_ram_test_active ? 1 : 0;
+	if (!secure_ram_test_active || secure_ram_test_owner != session) {
+		mutex_unlock(&lock);
+		return TEE_ERROR_BAD_STATE;
+	}
+	dcache_inv_range(secure_ram_test_page,
+			   PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE);
+	for (n = 0; n < PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE; n++)
+		if (secure_ram_test_page[n] != secure_ram_test_pattern[
+				n % sizeof(secure_ram_test_pattern)])
+			check.changed_bytes++;
+	check.unchanged = check.changed_bytes == 0;
+	memcpy(params[0].memref.buffer, &check, sizeof(check));
+	params[0].memref.size = sizeof(check);
+	mutex_unlock(&lock);
+	return TEE_SUCCESS;
+}
+
+static TEE_Result secure_ram_test_end(void *session, uint32_t types)
+{
+	const uint32_t expected = TEE_PARAM_TYPES(
+		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
+		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+
+	if (types != expected)
+		return TEE_ERROR_BAD_PARAMETERS;
+	mutex_lock(&lock);
+	if (!secure_ram_test_active || secure_ram_test_owner != session) {
+		mutex_unlock(&lock);
+		return TEE_ERROR_BAD_STATE;
+	}
+	secure_ram_test_clear();
+	mutex_unlock(&lock);
+	return TEE_SUCCESS;
+}
+#endif
 
 static uint64_t profile_now(void)
 {
@@ -1447,7 +1571,11 @@ static TEE_Result get_caps(uint32_t types, TEE_Param params[TEE_NUM_PARAMS])
 			    PTA_TNB_CAP_FFN_WEIGHT_SLOTS |
 			    PTA_TNB_CAP_MULTI_SLOT_CHAIN |
 			    PTA_TNB_CAP_CACHED_FFN_SLOT_SET |
-			    PTA_TNB_CAP_FUSED_SELECT_CHAIN,
+			    PTA_TNB_CAP_FUSED_SELECT_CHAIN
+#ifdef CFG_TNB_SECURITY_TEST
+			    | PTA_TNB_CAP_SECURE_RAM_TEST
+#endif
+			    ,
 		.max_templates = 1,
 		.max_tensors = 3,
 		.reserved = { PTA_TNB_BUILD_ID },
@@ -3241,6 +3369,10 @@ static void close_session(void *session)
 	size_t n = 0;
 
 	mutex_lock(&lock);
+#ifdef CFG_TNB_SECURITY_TEST
+	if (secure_ram_test_owner == session)
+		secure_ram_test_clear();
+#endif
 	if (dev.owner == session && dev.state == PTA_TNB_STATE_PREPARED) {
 		if ((dev.prepare_flags & PTA_TNB_PREPARE_FLAG_UNCACHED_COMMAND) &&
 		    !set_command_page_uncached(false)) {
@@ -3302,6 +3434,14 @@ static TEE_Result invoke_command(void *session, uint32_t command,
 		return exec_multi_slot_chain(session, types, params);
 	case PTA_TNB_CMD_SELECT_FFN_SLOT_SET:
 		return select_ffn_slot_set(session, types, params);
+#ifdef CFG_TNB_SECURITY_TEST
+	case PTA_TNB_CMD_SECURE_RAM_TEST_BEGIN:
+		return secure_ram_test_begin(session, types, params);
+	case PTA_TNB_CMD_SECURE_RAM_TEST_CHECK:
+		return secure_ram_test_check(session, types, params);
+	case PTA_TNB_CMD_SECURE_RAM_TEST_END:
+		return secure_ram_test_end(session, types);
+#endif
 	default:
 		return TEE_ERROR_NOT_SUPPORTED;
 	}

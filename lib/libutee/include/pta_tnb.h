@@ -26,6 +26,9 @@
 #define PTA_TNB_CMD_PREPARE_FFN_SLOT_SET 13
 #define PTA_TNB_CMD_EXEC_MULTI_SLOT_CHAIN 14
 #define PTA_TNB_CMD_SELECT_FFN_SLOT_SET 15
+#define PTA_TNB_CMD_SECURE_RAM_TEST_BEGIN 16
+#define PTA_TNB_CMD_SECURE_RAM_TEST_CHECK 17
+#define PTA_TNB_CMD_SECURE_RAM_TEST_END 18
 
 #define PTA_TNB_PREPARE_FLAG_SECURE_PTE (1u << 0)
 #define PTA_TNB_PREPARE_FLAG_FULL_SECURITY (1u << 1)
@@ -153,6 +156,27 @@ enum pta_tnb_debug_index {
 #define PTA_TNB_CAP_MULTI_SLOT_CHAIN (1u << 15)
 #define PTA_TNB_CAP_CACHED_FFN_SLOT_SET (1u << 16)
 #define PTA_TNB_CAP_FUSED_SELECT_CHAIN (1u << 17)
+#define PTA_TNB_CAP_SECURE_RAM_TEST (1u << 18)
+
+#define PTA_TNB_SECURE_RAM_TEST_VERSION 1
+#define PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE 4096
+#define PTA_TNB_SECURE_RAM_TEST_PATTERN_SIZE 32
+
+/* This ABI is compiled into the test-only Secure RAM validation path. */
+struct pta_tnb_secure_ram_test_info {
+	uint32_t version;
+	uint32_t page_size;
+	uint64_t physical_address;
+	uint64_t token;
+	uint8_t pattern[PTA_TNB_SECURE_RAM_TEST_PATTERN_SIZE];
+};
+
+struct pta_tnb_secure_ram_test_check {
+	uint32_t version;
+	uint32_t active;
+	uint32_t unchanged;
+	uint32_t changed_bytes;
+};
 
 #define PTA_TNB_USER_TA_UUID { 0x96d83ee6, 0x5ca4, 0x427e, \
 	{ 0xb3, 0xea, 0x90, 0xa7, 0x85, 0xd2, 0xe8, 0xa3 } }

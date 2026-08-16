@@ -4,6 +4,9 @@ srcs-$(CFG_ATTESTATION_PTA) += attestation.c
 srcs-$(CFG_DEVICE_ENUM_PTA) += device.c
 srcs-$(CFG_TA_GPROF_SUPPORT) += gprof.c
 srcs-$(CFG_TNB) += tnb.c
+ifeq ($(CFG_TNB_SECURITY_TEST),y)
+cflags-tnb.c-y += -DCFG_TNB_SECURITY_TEST=1
+endif
 ifeq ($(CFG_WITH_USER_TA),y)
 srcs-$(CFG_SECSTOR_TA_MGMT_PTA) += secstor_ta_mgmt.c
 endif
