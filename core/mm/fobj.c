@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <tee_api_types.h>
+#include <trace.h>
 #include <types_ext.h>
 #include <util.h>
 
@@ -757,20 +758,26 @@ struct fobj *fobj_sec_mem_alloc(unsigned int num_pages)
 	size_t size = 0;
 	void *va = NULL;
 
-	if (!f)
+	if (!f) {
+		EMSG("OOM_F fobj_meta size=%zu", sizeof(*f));
 		return NULL;
+	}
 
 	if (MUL_OVERFLOW(num_pages, SMALL_PAGE_SIZE, &size))
 		goto err;
 
 	f->mm = phys_mem_ta_alloc(size);
-	if (!f->mm)
+	if (!f->mm) {
+		EMSG("OOM_F sec_phys size=%zu", size);
 		goto err;
+	}
 
 	va = phys_to_virt(tee_mm_get_smem(f->mm), MEM_AREA_SEC_RAM_OVERALL,
 			  size);
-	if (!va)
+	if (!va) {
+		EMSG("OOM_F sec_map size=%zu", size);
 		goto err;
+	}
 
 	memtag_clear_mem(va, size);
 	f->fobj.ops = &ops_sec_mem;

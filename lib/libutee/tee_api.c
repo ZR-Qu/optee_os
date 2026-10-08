@@ -143,8 +143,10 @@ static TEE_Result map_tmp_param(struct utee_params *up, void **tmp_buf,
 
 	if (tbl) {
 		tb = tee_map_zi(tbl, TEE_MEMORY_ACCESS_ANY_OWNER);
-		if (!tb)
+		if (!tb) {
+			EMSG("OOM_F temp_param size=%zu", tbl);
 			return TEE_ERROR_OUT_OF_MEMORY;
+		}
 		*tmp_buf = tb;
 		*tmp_len = tbl;
 	}

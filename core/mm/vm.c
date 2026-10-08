@@ -304,8 +304,10 @@ TEE_Result vm_map_pad(struct user_mode_ctx *uctx, vaddr_t *va, size_t len,
 		return TEE_ERROR_BAD_PARAMETERS;
 
 	reg = calloc(1, sizeof(*reg));
-	if (!reg)
+	if (!reg) {
+		EMSG("OOM_F vm_region size=%zu", sizeof(*reg));
 		return TEE_ERROR_OUT_OF_MEMORY;
+	}
 
 	if (!mobj_is_paged(mobj)) {
 		uint32_t mem_type = 0;
@@ -331,8 +333,11 @@ TEE_Result vm_map_pad(struct user_mode_ctx *uctx, vaddr_t *va, size_t len,
 		goto err_put_mobj;
 
 	res = alloc_pgt(uctx);
-	if (res)
+	if (res) {
+		if (res == TEE_ERROR_OUT_OF_MEMORY)
+			EMSG("OOM_F vm_pgt size=%zu", reg->size);
 		goto err_rem_reg;
+	}
 
 	if (mobj_is_paged(mobj)) {
 		struct fobj *fobj = mobj_get_fobj(mobj);
@@ -979,6 +984,7 @@ TEE_Result vm_map_param(struct user_mode_ctx *uctx, struct tee_ta_param *param,
 			void *param_va[TEE_NUM_PARAMS])
 {
 	TEE_Result res = TEE_SUCCESS;
+	size_t mapped = 0;
 	size_t n;
 	size_t m;
 	struct param_mem mem[TEE_NUM_PARAMS];
@@ -1043,6 +1049,7 @@ TEE_Result vm_map_param(struct user_mode_ctx *uctx, struct tee_ta_param *param,
 	for (n = 0; n < m; n++) {
 		vaddr_t va = 0;
 
+		mapped += mem[n].size;
 		res = vm_map(uctx, &va, mem[n].size,
 			     TEE_MATTR_PRW | TEE_MATTR_URW,
 			     VM_FLAG_EPHEMERAL | VM_FLAG_SHAREABLE,
@@ -1068,6 +1075,8 @@ TEE_Result vm_map_param(struct user_mode_ctx *uctx, struct tee_ta_param *param,
 	}
 
 	res = alloc_pgt(uctx);
+	if (res == TEE_ERROR_OUT_OF_MEMORY)
+		EMSG("OOM_F param_pgt size=%zu", mapped);
 out:
 	if (res)
 		vm_clean_param(uctx);

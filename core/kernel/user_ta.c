@@ -53,8 +53,10 @@ static TEE_Result init_utee_param(struct utee_params *up,
 	struct utee_params *up_bbuf = NULL;
 
 	up_bbuf = bb_alloc(sizeof(struct utee_params));
-	if (!up_bbuf)
+	if (!up_bbuf) {
+		EMSG("OOM_F ta_param size=%zu", sizeof(struct utee_params));
 		return TEE_ERROR_OUT_OF_MEMORY;
+	}
 
 	up_bbuf->types = p->types;
 
@@ -158,6 +160,7 @@ static TEE_Result user_ta_enter(struct ts_session *session,
 
 	if (!inc_recursion()) {
 		/* Using this error code since we've run out of resources. */
+		EMSG("OOM_F ta_depth limit=%u", CFG_CORE_MAX_SYSCALL_RECURSION);
 		res = TEE_ERROR_OUT_OF_MEMORY;
 		goto out_clr_cancel;
 	}

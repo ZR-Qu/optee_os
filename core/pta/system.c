@@ -23,6 +23,7 @@
 #include <tee_api_defines_extensions.h>
 #include <tee_api_defines.h>
 #include <tee/tee_supp_plugin_rpc.h>
+#include <trace.h>
 #include <util.h>
 
 static unsigned int system_pnum;
@@ -168,12 +169,16 @@ static TEE_Result system_map_zi(struct user_mode_ctx *uctx,
 	pad_end = params[2].value.b;
 
 	f = fobj_ta_mem_alloc(ROUNDUP_DIV(num_bytes, SMALL_PAGE_SIZE));
-	if (!f)
+	if (!f) {
+		EMSG("OOM_F temp_pages size=%zu", ROUNDUP(num_bytes, SMALL_PAGE_SIZE));
 		return TEE_ERROR_OUT_OF_MEMORY;
+	}
 	mobj = mobj_with_fobj_alloc(f, NULL, TEE_MATTR_MEM_TYPE_TAGGED);
 	fobj_put(f);
-	if (!mobj)
+	if (!mobj) {
+		EMSG("OOM_F temp_mobj size=%zu", num_bytes);
 		return TEE_ERROR_OUT_OF_MEMORY;
+	}
 	res = vm_map_pad(uctx, &va, num_bytes, prot, vm_flags,
 			 mobj, 0, pad_begin, pad_end, 0);
 	mobj_put(mobj);
