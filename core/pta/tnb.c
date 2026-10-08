@@ -9,11 +9,9 @@
 #include <kernel/tee_ta_manager.h>
 #include <kernel/ts_manager.h>
 #include <kernel/user_mode_ctx.h>
-#include <malloc.h>
 #include <mm/core_memprot.h>
 #include <mm/mobj.h>
 #include <mm/page_alloc.h>
-#include <mm/phys_mem.h>
 #include <mm/vm.h>
 #include <platform_config.h>
 #include <pta_tnb.h>
@@ -21,6 +19,8 @@
 #include <string.h>
 #include <trace.h>
 
+#include "tnb_npu.h"
+#include "tnb_iommu.h"
 #include "tnb_gemm.h"
 
 #define NPU_INT_MASK 0x20
@@ -31,7 +31,6 @@
 #define NPU_PC_DATA_ADDR 0x10
 #define NPU_PC_DATA_AMOUNT 0x14
 #define NPU_PC_TASK_CONTROL 0x30
-#define NPU_PC_DMA_BASE_ADDR 0x34
 #define NPU_PC_TASK_STATUS 0x3c
 #define NPU_CNA_POINTER 0x1004
 #define NPU_CORE_POINTER 0x3004
@@ -56,29 +55,7 @@
 #define IOMMU1_BASE (NPU_BASE + 0xa000)
 #define IOMMU2_BASE (NPU1_BASE + 0xa000)
 #define IOMMU3_BASE (NPU2_BASE + 0xa000)
-#define IOMMU_DTE 0x0
-#define IOMMU_STATUS 0x4
-#define IOMMU_COMMAND 0x8
-#define IOMMU_PAGE_FAULT_ADDR 0xc
-#define IOMMU_ZAP_ONE_LINE 0x10
-#define IOMMU_INT_RAW_STATUS 0x14
-#define IOMMU_INT_CLEAR 0x18
-#define IOMMU_INT_MASK 0x1c
-#define IOMMU_INT_STATUS 0x20
-#define IOMMU_AUTO_GATING 0x24
-#define IOMMU_STATUS_PAGING BIT(0)
-#define IOMMU_STATUS_FAULT BIT(1)
-#define IOMMU_STATUS_STALL BIT(2)
-#define IOMMU_FAULT (BIT(0) | BIT(1))
-#define IOMMU_CMD_ENABLE_PAGING 0
-#define IOMMU_CMD_DISABLE_PAGING 1
-#define IOMMU_CMD_ENABLE_STALL 2
-#define IOMMU_CMD_DISABLE_STALL 3
-#define IOMMU_CMD_ZAP_CACHE 4
-#define IOMMU_DISABLE_FETCH_LIMIT BIT(31)
 
-#define GICD_CTLR 0x0
-#define GICD_CTLR_RWP BIT(31)
 #define GICD_ISENABLER 0x100
 #define GICD_ICENABLER 0x180
 #define GICD_ICPENDR 0x280
@@ -88,13 +65,13 @@
 #define TNB_DT_ENTRIES 1024
 #define TNB_PT_ENTRIES 1024
 /* Match the IOVA window used by the Linux RKNPU allocator. */
-#define TNB_IOVA_CMD 0x10000000
-#define TNB_IOVA_CMD_CORE(core) (TNB_IOVA_CMD + (core) * TNB_PAGE_SIZE)
-#define TNB_IOVA_A 0x11000000
-#define TNB_IOVA_B 0x12000000
-#define TNB_IOVA_B2 0x14000000
-#define TNB_IOVA_B3 0x15000000
-#define TNB_IOVA_C 0x13000000
+#define TNB_IOVA_INPUT 0x11000000
+#define TNB_IOVA_WEIGHT 0x12000000
+#define TNB_IOVA_WEIGHT_SLOT(slot) \
+	((slot) == PTA_TNB_FFN_WEIGHT_SLOT_GATE ? 0x12000000 : \
+	 (slot) == PTA_TNB_FFN_WEIGHT_SLOT_UP ? 0x14000000 : 0x15000000)
+#define TNB_IOVA_OUTPUT 0x13000000
+#define TNB_IOVA_GEMM_B1 0x14000000
 #define TNB_IOVA_DTE_SHIFT 22
 #define TNB_IOVA_PTE_SHIFT 12
 #define TNB_PTE_VALID BIT(0)
@@ -105,20 +82,15 @@
 #define TNB_DESC_HI1_MASK GENMASK_64(35, 32)
 #define TNB_DESC_HI2_MASK GENMASK_64(39, 36)
 #define TNB_TIMEOUT_US 100000
-#define TNB_TRAILER_COUNT 4
-#define TNB_MAX_B_SIZE 12582912
-#define TNB_PAGE_TABLE_COUNT 12
+#define TNB_PAGE_TABLE_COUNT 2
+#define TNB_FFN_WEIGHT_CACHE_COUNT 84
+#define TNB_FFN_WEIGHT_PTE_TABLE_COUNT 3
+#define TNB_INPUT_STORAGE_SIZE 57344
+#define TNB_OUTPUT_STORAGE_SIZE PTA_TNB_MAX_BATCH_OUTPUT_SIZE
 
-#define TNB_FLAG_FULL_SECURITY BIT(1)
-#define TNB_FLAG_UNCACHED_COMMAND BIT(4)
-#define TNB_FLAGS (TNB_FLAG_FULL_SECURITY | TNB_FLAG_UNCACHED_COMMAND)
-
-#define TNB_COMMAND_WITH_VALUE(entry, value) \
-	(((entry) & ~GENMASK_64(47, 16)) | ((uint64_t)(value) << 16))
-
-#define TNB_A_REG 0x1070
-#define TNB_B_REG 0x1110
-#define TNB_C_REG 0x4020
+#define TNB_INPUT_REG 0x1070
+#define TNB_WEIGHT_REG 0x1110
+#define TNB_OUTPUT_REG 0x4020
 
 struct tnb_hw_snapshot {
 	uint32_t bussgrf;
@@ -130,15 +102,41 @@ struct tnb_hw_snapshot {
 	uint32_t iommu_status[4];
 };
 
-struct tnb_mmu_save {
-	uint32_t dte;
-	uint32_t int_mask;
-	uint32_t auto_gating;
-	bool paging;
+/* Secure PTE storage has a fixed budget, independent of the core heap.
+ * Each page maps 4 MiB. No separate array of backing PAs is retained. */
+#define TNB_REGISTERED_PT_PAGES 256
+static uint32_t registered_pt[TNB_REGISTERED_PT_PAGES][TNB_PT_ENTRIES]
+    __aligned(TNB_PAGE_SIZE);
+static bool registered_pt_used[TNB_REGISTERED_PT_PAGES];
+static uint32_t next_weight_handle;
+struct tnb_registered_weight {
+    struct tnb_registered_weight *next;
+    struct mobj *mobj;
+    size_t offset, size;
+    uint32_t handle, first, count;
+    paddr_t table_pa[3];
+};
+#define TNB_GENERIC_PLAN_CACHE_COUNT 4u
+struct tnb_generic_plan {
+    bool valid;
+    struct pta_tnb_gemm_batch batch;
+    struct tnb_reg config[PTA_TNB_GEMM_MAX_JOBS][TNB_GEMM_WRITES];
+};
+struct tnb_session {
+    struct tnb_generic_plan *plans;
+    uint32_t next_plan;
+    struct tnb_registered_weight *weights;
 };
 
 struct tnb_dev {
+    size_t input_used, output_used;
 	void *owner;
+	uint32_t generic_count;
+	bool generic_selected;
+	uint32_t generic_b[PTA_TNB_GEMM_MAX_JOBS];
+	uint32_t generic_offset[PTA_TNB_GEMM_MAX_JOBS];
+	struct pta_tnb_gemm generic_gemm[PTA_TNB_GEMM_MAX_JOBS];
+	struct tnb_reg generic_config[PTA_TNB_GEMM_MAX_JOBS][TNB_GEMM_WRITES];
 	uint32_t state;
 	uint32_t stage;
 	uint32_t fault;
@@ -152,24 +150,20 @@ struct tnb_dev {
 	uint32_t prepare_flags;
 	uint32_t pte_flags;
 	uint32_t debug[PTA_TNB_DEBUG_WORDS];
-	uint32_t command_count[PTA_TNB_MAX_CORES];
 	uint32_t interrupt_mask[PTA_TNB_MAX_CORES];
 	uint32_t completed_mask;
 	uint32_t core_count;
-	uint32_t a_size;
-	uint32_t b_size;
-	uint32_t c_size;
-	uint32_t mode;
-	size_t a_span;
-	size_t c_span;
-	struct pta_tnb_batch batch;
-	bool batched;
-	struct mobj *b_mobj[PTA_TNB_MAX_B_INPUTS];
-	size_t b_span[PTA_TNB_MAX_B_INPUTS];
+	uint32_t input_size;
+	uint32_t weight_size;
+	uint32_t output_size;
+	uint32_t input_mapping_size;
+	uint32_t output_mapping_size;
+	uint32_t template_id;
+	uint32_t weight_cookie;
+	void *weight_buffer;
 	uint32_t old_npu_mask[PTA_TNB_MAX_CORES];
 	bool irq_enabled[PTA_TNB_MAX_CORES];
-	bool irq_held;
-	bool secure_held;
+	bool security_touched;
 	bool completed_trace_valid;
 	struct pta_tnb_trace failure_trace;
 	struct pta_tnb_trace completed_trace;
@@ -177,157 +171,23 @@ struct tnb_dev {
 	struct tnb_mmu_save mmu[4];
 };
 
-static uint64_t cached_command_page[PTA_TNB_MAX_CORES]
-	[TNB_PAGE_SIZE / sizeof(uint64_t)]
-	__aligned(TNB_PAGE_SIZE);
-static uint64_t *uncached_command_page;
-static paddr_t uncached_command_pa;
-static bool command_page_is_mapped;
-static bool command_page_is_uncached;
+static struct tnb_reg config[PTA_TNB_MAX_CORES][TNB_GEMM_WRITES];
 static struct pta_tnb_trace last_success_trace;
 static uint32_t last_success_sequence;
 static uint32_t last_failure_sequence;
-static uint8_t *a_pages;
-static uint8_t *c_pages;
-static tee_mm_entry_t *staging_mm;
-static uint8_t *staging_pages;
-
-#define TNB_STAGING_SIZE \
-	(ROUNDUP(TNB_GEMM_M_MAX * TNB_GEMM_K_MAX, TNB_PAGE_SIZE) + \
-	 ROUNDUP(TNB_GEMM_M_MAX * TNB_GEMM_N_MAX * sizeof(int32_t), TNB_PAGE_SIZE))
+static uint8_t input_pages[TNB_INPUT_STORAGE_SIZE] __aligned(TNB_PAGE_SIZE);
+static uint8_t output_pages[TNB_OUTPUT_STORAGE_SIZE] __aligned(TNB_PAGE_SIZE);
+static bool fixed_tables_ready;
+static uint32_t fixed_dte[2];
 static uint32_t directory_table[TNB_DT_ENTRIES] __aligned(TNB_PAGE_SIZE);
 static uint32_t page_tables[TNB_PAGE_TABLE_COUNT][TNB_PT_ENTRIES]
 	__aligned(TNB_PAGE_SIZE);
-#ifdef CFG_TNB_SECURITY_TEST
-static uint8_t secure_ram_test_page[PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE]
-	__aligned(TNB_PAGE_SIZE);
-static bool secure_ram_test_active;
-static void *secure_ram_test_owner;
-static const uint8_t secure_ram_test_pattern[TNB_PAGE_SIZE / 128] = {
-	0x4c, 0x4c, 0x4d, 0x2d, 0x54, 0x5a, 0x2d, 0x53,
-	0x45, 0x43, 0x55, 0x52, 0x45, 0x2d, 0x56, 0x31,
-	0x91, 0x27, 0xa4, 0x6e, 0x53, 0xd8, 0x0b, 0xf2,
-	0x6a, 0xc1, 0x39, 0x7d, 0xe5, 0x48, 0xb0, 0x16,
-};
-#endif
 static struct tnb_dev dev;
 static struct pta_tnb_profile profile;
+static struct pta_tnb_batch_profile batch_profile;
 static struct mutex lock = MUTEX_INITIALIZER;
 
-static TEE_Result close_device(void *session, uint32_t types, bool keep_command,
-			       bool keep_work, bool keep_irq, bool keep_secure);
-
-#ifdef CFG_TNB_SECURITY_TEST
-static void secure_ram_test_clear(void)
-{
-	memset(secure_ram_test_page, 0, PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE);
-	dcache_clean_range(secure_ram_test_page,
-			   PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE);
-	secure_ram_test_active = false;
-	secure_ram_test_owner = NULL;
-}
-
-static TEE_Result secure_ram_test_begin(void *session, uint32_t types,
-					TEE_Param params[TEE_NUM_PARAMS])
-{
-	struct pta_tnb_secure_ram_test_info info = { 0 };
-	paddr_t pa;
-	size_t n;
-	const uint32_t expected = TEE_PARAM_TYPES(
-		TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_NONE,
-		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-
-	if (types != expected || !params[0].memref.buffer)
-		return TEE_ERROR_BAD_PARAMETERS;
-	if (params[0].memref.size < sizeof(info)) {
-		params[0].memref.size = sizeof(info);
-		return TEE_ERROR_SHORT_BUFFER;
-	}
-
-	mutex_lock(&lock);
-	if (secure_ram_test_active || dev.state != PTA_TNB_STATE_READY) {
-		mutex_unlock(&lock);
-		return TEE_ERROR_BAD_STATE;
-	}
-	pa = virt_to_phys(secure_ram_test_page);
-	if (!pa || (pa & (TNB_PAGE_SIZE - 1)) ||
-	    !core_pbuf_is(CORE_MEM_SEC, pa,
-			   PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE)) {
-		mutex_unlock(&lock);
-		return TEE_ERROR_SECURITY;
-	}
-	for (n = 0; n < PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE; n++)
-		secure_ram_test_page[n] = secure_ram_test_pattern[
-		n % sizeof(secure_ram_test_pattern)];
-	dcache_clean_range(secure_ram_test_page,
-			   PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE);
-	secure_ram_test_active = true;
-	secure_ram_test_owner = session;
-	info.version = PTA_TNB_SECURE_RAM_TEST_VERSION;
-	info.page_size = PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE;
-	info.physical_address = (uint64_t)pa;
-	info.token = UINT64_C(0x4c4c4d545a534543);
-	memcpy(info.pattern, secure_ram_test_pattern, sizeof(info.pattern));
-	memcpy(params[0].memref.buffer, &info, sizeof(info));
-	params[0].memref.size = sizeof(info);
-	mutex_unlock(&lock);
-	return TEE_SUCCESS;
-}
-
-static TEE_Result secure_ram_test_check(void *session, uint32_t types,
-					TEE_Param params[TEE_NUM_PARAMS])
-{
-	struct pta_tnb_secure_ram_test_check check = { 0 };
-	const uint32_t expected = TEE_PARAM_TYPES(
-		TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_NONE,
-		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	size_t n;
-
-	if (types != expected || !params[0].memref.buffer)
-		return TEE_ERROR_BAD_PARAMETERS;
-	if (params[0].memref.size < sizeof(check)) {
-		params[0].memref.size = sizeof(check);
-		return TEE_ERROR_SHORT_BUFFER;
-	}
-
-	mutex_lock(&lock);
-	check.version = PTA_TNB_SECURE_RAM_TEST_VERSION;
-	check.active = secure_ram_test_active ? 1 : 0;
-	if (!secure_ram_test_active || secure_ram_test_owner != session) {
-		mutex_unlock(&lock);
-		return TEE_ERROR_BAD_STATE;
-	}
-	dcache_inv_range(secure_ram_test_page,
-			   PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE);
-	for (n = 0; n < PTA_TNB_SECURE_RAM_TEST_PAGE_SIZE; n++)
-		if (secure_ram_test_page[n] != secure_ram_test_pattern[
-				n % sizeof(secure_ram_test_pattern)])
-			check.changed_bytes++;
-	check.unchanged = check.changed_bytes == 0;
-	memcpy(params[0].memref.buffer, &check, sizeof(check));
-	params[0].memref.size = sizeof(check);
-	mutex_unlock(&lock);
-	return TEE_SUCCESS;
-}
-
-static TEE_Result secure_ram_test_end(void *session, uint32_t types)
-{
-	const uint32_t expected = TEE_PARAM_TYPES(
-		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
-		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-
-	if (types != expected)
-		return TEE_ERROR_BAD_PARAMETERS;
-	mutex_lock(&lock);
-	if (!secure_ram_test_active || secure_ram_test_owner != session) {
-		mutex_unlock(&lock);
-		return TEE_ERROR_BAD_STATE;
-	}
-	secure_ram_test_clear();
-	mutex_unlock(&lock);
-	return TEE_SUCCESS;
-}
-#endif
+static TEE_Result close_device(void *session, uint32_t types);
 
 static uint64_t profile_now(void)
 {
@@ -384,91 +244,8 @@ static bool page_in_area(void *buffer, uint32_t area)
 	       core_pbuf_is(area, pa, TNB_PAGE_SIZE);
 }
 
-static bool init_uncached_command_page(void)
-{
-	vaddr_t va = 0;
-	paddr_t pa = 0;
-	size_t n = 0;
 
-	if (uncached_command_page)
-		return true;
-	va = virt_page_alloc(PTA_TNB_MAX_CORES, MAF_ZERO_INIT);
-	if (!va)
-		return false;
-	pa = virt_to_phys((void *)va);
-	if (!pa)
-		return false;
-	uncached_command_page = (uint64_t *)va;
-	uncached_command_pa = pa;
-	command_page_is_mapped = true;
-	command_page_is_uncached = false;
-	for (n = 0; n < PTA_TNB_MAX_CORES; n++)
-		if (!secure_page(uncached_command_page +
-				 n * TNB_PAGE_SIZE / sizeof(uint64_t)))
-			return false;
-	return true;
-}
 
-static bool set_command_page_uncached(bool uncached)
-{
-	enum teecore_memtypes old_type = MEM_AREA_TEE_DYN_VASPACE;
-	enum teecore_memtypes new_type = MEM_AREA_TEE_DYN_VASPACE;
-	TEE_Result res = TEE_SUCCESS;
-	vaddr_t va = (vaddr_t)uncached_command_page;
-	bool was_mapped = command_page_is_mapped;
-	bool was_uncached = command_page_is_uncached;
-
-	if (!uncached_command_page || !uncached_command_pa)
-		return false;
-	if (command_page_is_mapped && command_page_is_uncached == uncached)
-		return true;
-	if (command_page_is_uncached)
-		old_type = MEM_AREA_IO_SEC;
-	if (uncached) {
-		if (command_page_is_mapped && !command_page_is_uncached)
-			dcache_cleaninv_range(uncached_command_page,
-					      PTA_TNB_MAX_CORES * TNB_PAGE_SIZE);
-		dsb();
-		new_type = MEM_AREA_IO_SEC;
-	}
-	if (command_page_is_mapped) {
-		core_mmu_unmap_pages(va, PTA_TNB_MAX_CORES);
-		command_page_is_mapped = false;
-	}
-	res = core_mmu_map_contiguous_pages(va, uncached_command_pa,
-					    PTA_TNB_MAX_CORES,
-					    new_type);
-	if (res)
-		goto restore;
-	command_page_is_mapped = true;
-	command_page_is_uncached = uncached;
-	dsb();
-	if (virt_to_phys(uncached_command_page) == uncached_command_pa)
-		return true;
-	core_mmu_unmap_pages(va, PTA_TNB_MAX_CORES);
-	command_page_is_mapped = false;
-restore:
-	if (was_mapped &&
-	    !core_mmu_map_contiguous_pages(va, uncached_command_pa,
-					   PTA_TNB_MAX_CORES,
-					   old_type)) {
-		command_page_is_mapped = true;
-		command_page_is_uncached = was_uncached;
-		dsb();
-	}
-	return false;
-}
-
-static uint64_t *command_buffer(size_t core)
-{
-	if (core >= PTA_TNB_MAX_CORES)
-		return NULL;
-	if ((dev.prepare_flags & TNB_FLAG_UNCACHED_COMMAND) &&
-	    uncached_command_page)
-		return uncached_command_page +
-		       core * TNB_PAGE_SIZE / sizeof(uint64_t);
-	return cached_command_page[core];
-}
 
 static uint32_t make_desc_v2(paddr_t pa)
 {
@@ -495,34 +272,16 @@ static size_t pte_index(uint32_t iova)
 	return (iova >> TNB_IOVA_PTE_SHIFT) & 0x3ff;
 }
 
-static uint32_t b_address(uint32_t index)
-{
-	const uint32_t bases[] = { TNB_IOVA_B, TNB_IOVA_B2, TNB_IOVA_B3 };
-
-	return bases[index];
-}
-
 static uint32_t *page_table_for_iova(uint32_t iova)
 {
-	size_t dte = dte_index(iova);
-	size_t b_dte = dte_index(TNB_IOVA_B);
-
-	if (dte == dte_index(TNB_IOVA_CMD))
-		return page_tables[0];
-	if (dte == dte_index(TNB_IOVA_A))
-		return page_tables[1];
-	if (dte >= b_dte && dte < b_dte + 3)
-		return page_tables[2 + dte - b_dte];
-	if (dte >= dte_index(TNB_IOVA_B2) &&
-	    dte < dte_index(TNB_IOVA_B2) + 3)
-		return page_tables[6 + dte - dte_index(TNB_IOVA_B2)];
-	if (dte >= dte_index(TNB_IOVA_B3) &&
-	    dte < dte_index(TNB_IOVA_B3) + 3)
-		return page_tables[9 + dte - dte_index(TNB_IOVA_B3)];
-	if (dte == dte_index(TNB_IOVA_C))
-		return page_tables[5];
-	return NULL;
+    size_t dte = dte_index(iova);
+    if (dte == dte_index(TNB_IOVA_INPUT))
+        return page_tables[0];
+    if (dte == dte_index(TNB_IOVA_OUTPUT))
+        return page_tables[1];
+    return NULL;
 }
+
 
 static bool install_page_table(uint32_t iova)
 {
@@ -548,10 +307,11 @@ static bool map_page(uint32_t iova, paddr_t pa, uint32_t flags,
 	return true;
 }
 
-static bool map_secure_buffer(uint32_t iova, void *buffer, size_t size,
-			      uint32_t flags)
+static bool map_buffer(uint32_t iova, void *buffer, size_t size,
+		       uint32_t flags, bool secure)
 {
 	size_t offset = 0;
+	enum buf_is_attr area = secure ? CORE_MEM_SEC : CORE_MEM_NON_SEC;
 
 	if (!buffer || !size || ((vaddr_t)buffer & (TNB_PAGE_SIZE - 1)) ||
 	    (iova & (TNB_PAGE_SIZE - 1)))
@@ -561,127 +321,107 @@ static bool map_secure_buffer(uint32_t iova, void *buffer, size_t size,
 		void *page = (uint8_t *)buffer + offset;
 		paddr_t pa = virt_to_phys(page);
 
-		if (!page_in_area(page, CORE_MEM_SEC) ||
-		    !map_page(iova + offset, pa, flags, dev.pte_flags))
+		if (!page_in_area(page, area) ||
+		    !map_page(iova + offset, pa, flags,
+			      secure ? dev.pte_flags : 0))
 			return false;
 	}
 	return true;
 }
 
-static bool map_public_buffer(uint32_t iova, void *buffer, size_t size,
-			      struct mobj **hold)
+/* Registered generic jobs share fixed secure A/C staging.
+ * Preserve these two PTE pages; only the per-window DTE bindings change. */
+static bool prepare_fixed_page_tables(void)
+{
+    const uint32_t iova[2] = { TNB_IOVA_INPUT, TNB_IOVA_OUTPUT };
+    const uint32_t table[2] = { 0, 1 };
+
+    if (!fixed_tables_ready) {
+        for (uint32_t i = 0; i < 2; i++) {
+            memset(page_tables[table[i]], 0, sizeof(page_tables[0]));
+            if (!install_page_table(iova[i]))
+                return false;
+            fixed_dte[i] = directory_table[dte_index(iova[i])];
+        }
+        if (!map_buffer(TNB_IOVA_INPUT, input_pages, sizeof(input_pages),
+                        TNB_PTE_READ, true) ||
+            !map_buffer(TNB_IOVA_OUTPUT, output_pages, sizeof(output_pages),
+                        TNB_PTE_READ | TNB_PTE_WRITE, true))
+            return false;
+        for (uint32_t i = 0; i < 2; i++)
+            dcache_clean_range(page_tables[table[i]], sizeof(page_tables[0]));
+        fixed_tables_ready = true;
+    }
+    for (uint32_t i = 0; i < 2; i++)
+        directory_table[dte_index(iova[i])] = fixed_dte[i];
+    dcache_clean_range(directory_table, sizeof(directory_table));
+    dev.debug[PTA_TNB_DEBUG_PTE_INPUT] = page_tables[0][pte_index(TNB_IOVA_INPUT)];
+    dev.debug[PTA_TNB_DEBUG_PTE_OUTPUT] = page_tables[1][pte_index(TNB_IOVA_OUTPUT)];
+    return true;
+}
+
+static bool caller_buffer_mobj(void *buffer, size_t size,
+			       struct mobj **mobj, size_t *mobj_offset)
 {
 	struct ts_session *caller = ts_get_calling_session();
 	struct user_mode_ctx *uctx = NULL;
-	struct mobj *mobj = NULL;
-	size_t offset = 0;
-	size_t span = ROUNDUP(size, TNB_PAGE_SIZE);
-	size_t n = 0;
-	size_t phys_offset = 0;
+	size_t physical_offset = 0;
 
 	if (!caller || !is_user_ta_ctx(caller->ctx) || !buffer || !size ||
-	    ((vaddr_t)buffer & (TNB_PAGE_SIZE - 1)))
+	    !mobj || !mobj_offset)
 		return false;
 	uctx = to_user_mode_ctx(caller->ctx);
-	if (vm_buf_to_mboj_offs(uctx, buffer, span, &mobj, &offset) ||
-	    !mobj || !mobj_is_nonsec(mobj) ||
-	    !mobj_check_offset_and_len(mobj, offset, span))
+	if (vm_buf_to_mboj_offs(uctx, buffer, size, mobj, mobj_offset) ||
+	    !*mobj || !mobj_is_nonsec(*mobj))
 		return false;
-	phys_offset = mobj_get_phys_offs(mobj, TNB_PAGE_SIZE);
-	if (ADD_OVERFLOW(phys_offset, offset, &phys_offset) ||
-	    (phys_offset & (TNB_PAGE_SIZE - 1)))
+	physical_offset = mobj_get_phys_offs(*mobj, TNB_PAGE_SIZE);
+	if (ADD_OVERFLOW(physical_offset, *mobj_offset, &physical_offset) ||
+	    (physical_offset & (TNB_PAGE_SIZE - 1)) ||
+	    !mobj_check_offset_and_len(*mobj, *mobj_offset, size))
 		return false;
-	for (n = 0; n < span; n += TNB_PAGE_SIZE) {
-		paddr_t pa = 0;
-
-		if (mobj_get_pa(mobj, offset + n, TNB_PAGE_SIZE, &pa) ||
-		    !map_page(iova + n, pa, TNB_PTE_READ, 0))
-			return false;
-	}
-	if (hold)
-		*hold = mobj_get(mobj);
 	return true;
 }
 
-static bool prepare_page_tables(TEE_Param b[PTA_TNB_MAX_B_INPUTS])
+/* Keep the largest page-rounded A/C footprint of the entire window, not
+ * just the final wave (Down and short tails commonly use less space). */
+static void record_generic_work(void)
 {
-	size_t n = 0;
-	uint32_t index;
-	uint32_t count = dev.batched ? dev.batch.b_count : 1;
-
-	if (!secure_page(directory_table))
-		return false;
-	memset(directory_table, 0, sizeof(directory_table));
-	memset(page_tables, 0, sizeof(page_tables));
-	if (!install_page_table(TNB_IOVA_CMD) ||
-	    !install_page_table(TNB_IOVA_A) ||
-	    !install_page_table(TNB_IOVA_C))
-		return false;
-	if (!map_secure_buffer(TNB_IOVA_CMD, command_buffer(0), TNB_PAGE_SIZE,
-			       TNB_PTE_READ) ||
-	    !map_secure_buffer(TNB_IOVA_A, a_pages, dev.a_span, TNB_PTE_READ) ||
-	    !map_secure_buffer(TNB_IOVA_C, c_pages, dev.c_span,
-			       TNB_PTE_READ | TNB_PTE_WRITE))
-		return false;
-	for (index = 0; index < count; index++) {
-		uint32_t iova = b_address(index);
-
-		for (n = 0; n < ROUNDUP(dev.b_span[index], SIZE_M(4)); n += SIZE_M(4))
-			if (!install_page_table(iova + n))
-				return false;
-		if (!map_public_buffer(iova, b[index].memref.buffer,
-				       dev.b_span[index],
-				       dev.batched ? &dev.b_mobj[index] : NULL))
-			return false;
-	}
-
-	dcache_clean_range(directory_table, sizeof(directory_table));
-	for (n = 0; n < TNB_PAGE_TABLE_COUNT; ++n)
-		dcache_clean_range(page_tables[n], sizeof(page_tables[n]));
-	dev.debug[PTA_TNB_DEBUG_PTE_CMD] =
-		page_table_for_iova(TNB_IOVA_CMD)[pte_index(TNB_IOVA_CMD)];
-	dev.debug[PTA_TNB_DEBUG_PTE_A] =
-		page_table_for_iova(TNB_IOVA_A)[pte_index(TNB_IOVA_A)];
-	dev.debug[PTA_TNB_DEBUG_PTE_B] =
-		page_table_for_iova(TNB_IOVA_B)[pte_index(TNB_IOVA_B)];
-	dev.debug[PTA_TNB_DEBUG_PTE_C] =
-		page_table_for_iova(TNB_IOVA_C)[pte_index(TNB_IOVA_C)];
-	return true;
+    dev.input_used = MAX(dev.input_used, ROUNDUP(dev.input_size, TNB_PAGE_SIZE));
+    dev.output_used = MAX(dev.output_used, ROUNDUP(dev.output_size, TNB_PAGE_SIZE));
 }
 
-static void clear_work(bool keep_command)
+static void clear_work(void)
 {
-	size_t input_clear_size = a_pages ? dev.a_span : 0;
-	size_t output_clear_size = c_pages ? dev.c_span : 0;
-	uint64_t *cmd = command_buffer(0);
+    bool locked = dev.state == PTA_TNB_STATE_LOCKED;
+    size_t input_clear_size = locked ? sizeof(input_pages) : dev.input_used;
+    size_t output_clear_size = locked ? sizeof(output_pages) : dev.output_used;
 
-	if (!keep_command && cmd)
-		memset(cmd, 0, TNB_PAGE_SIZE);
-	if (!keep_command && uncached_command_page && command_page_is_mapped &&
-	    !command_page_is_uncached)
-		memset(uncached_command_page, 0, TNB_PAGE_SIZE);
-	if (input_clear_size)
-		memset(a_pages, 0, input_clear_size);
-	if (output_clear_size)
-		memset(c_pages, 0, output_clear_size);
-	memset(directory_table, 0, sizeof(directory_table));
-	memset(page_tables, 0, sizeof(page_tables));
-	if (!keep_command)
-		dcache_clean_range(cached_command_page, sizeof(cached_command_page));
-	if (input_clear_size)
-		dcache_clean_range(a_pages, input_clear_size);
-	if (output_clear_size)
-		dcache_clean_range(c_pages, output_clear_size);
-	dcache_clean_range(directory_table, sizeof(directory_table));
-	dcache_clean_range(page_tables, sizeof(page_tables));
-	dsb();
-	a_pages = NULL;
-	c_pages = NULL;
-	for (size_t index = 0; index < PTA_TNB_MAX_B_INPUTS; index++) {
-		mobj_put(dev.b_mobj[index]);
-		dev.b_mobj[index] = NULL;
-	}
+    if (locked)
+        fixed_tables_ready = false;
+    dev.input_used = 0;
+    dev.output_used = 0;
+    dev.template_id = 0;
+    dev.weight_cookie = 0;
+    dev.weight_buffer = NULL;
+    dev.generic_count = 0;
+    dev.generic_selected = false;
+    if (input_clear_size) {
+        memset(input_pages, 0, input_clear_size);
+        dcache_clean_range(input_pages, input_clear_size);
+    }
+    if (output_clear_size) {
+        memset(output_pages, 0, output_clear_size);
+        dcache_clean_range(output_pages, output_clear_size);
+    }
+    memset(directory_table, 0, sizeof(directory_table));
+    dcache_clean_range(directory_table, sizeof(directory_table));
+    if (!fixed_tables_ready) {
+        memset(page_tables, 0, sizeof(page_tables));
+        dcache_clean_range(page_tables, sizeof(page_tables));
+    }
+    dsb();
 }
+
 
 static TEE_Result snapshot(struct tnb_hw_snapshot *out)
 {
@@ -713,6 +453,12 @@ static bool snapshot_equal(const struct tnb_hw_snapshot *left,
 {
 	return !memcmp(left, right, sizeof(*left));
 }
+
+
+/* CPU memory observations only: these do not prove what the NPU fetched.
+ * NXR8 uses generic-only debug slots 52..55/59..62; no ABI-size change. */
+
+
 
 static bool mmu_fault(void)
 {
@@ -753,199 +499,53 @@ static void capture_run_status(vaddr_t npu)
 	}
 }
 
-static bool wait_iommu_status_mask(uint32_t bit, bool set, uint32_t banks)
+static bool iommu_bases(vaddr_t bases[TNB_IOMMU_BANKS])
 {
-	uint64_t deadline = timeout_init_us(1000);
+	size_t n = 0;
 
-	while (!timeout_elapsed(deadline)) {
-		bool ready = true;
-		size_t n = 0;
-
-		for (n = 0; n < 4; n++) {
-			if (!(banks & BIT(n)))
-				continue;
-			vaddr_t iommu = iommu_map(n);
-			bool value = iommu && !!(io_read32(iommu + IOMMU_STATUS) & bit);
-
-			if (!iommu || value != set)
-				ready = false;
-		}
-		if (ready)
-			return true;
-		udelay(1);
+	for (n = 0; n < TNB_IOMMU_BANKS; n++) {
+		bases[n] = iommu_map(n);
+		if (!bases[n])
+			return false;
 	}
-	return false;
-}
-
-static bool wait_iommu_status(uint32_t bit, bool set)
-{
-	return wait_iommu_status_mask(bit, set, 0xf);
-}
-
-static bool wait_iommu_paging(const struct tnb_mmu_save saved[4])
-{
-	uint64_t deadline = timeout_init_us(1000);
-
-	while (!timeout_elapsed(deadline)) {
-		bool ready = true;
-		size_t n = 0;
-
-		for (n = 0; n < 4; n++) {
-			vaddr_t iommu = iommu_map(n);
-
-			if (!iommu ||
-			    !!(io_read32(iommu + IOMMU_STATUS) &
-			       IOMMU_STATUS_PAGING) != saved[n].paging)
-				ready = false;
-		}
-		if (ready)
-			return true;
-		udelay(1);
-	}
-	return false;
+	return true;
 }
 
 static bool disable_iommu(struct tnb_mmu_save saved[4])
 {
-	size_t n = 0;
-	uint32_t paging_banks = 0;
+	vaddr_t bases[TNB_IOMMU_BANKS] = { };
 
-	for (n = 0; n < 4; n++) {
-		vaddr_t iommu = iommu_map(n);
-
-		if (!iommu)
-			return false;
-		saved[n].dte = io_read32(iommu + IOMMU_DTE);
-		saved[n].int_mask = io_read32(iommu + IOMMU_INT_MASK);
-		saved[n].auto_gating = io_read32(iommu + IOMMU_AUTO_GATING);
-		saved[n].paging = !!(io_read32(iommu + IOMMU_STATUS) &
-					IOMMU_STATUS_PAGING);
-		io_write32(iommu + IOMMU_INT_MASK, 0);
-		if (saved[n].paging) {
-			paging_banks |= BIT(n);
-			io_write32(iommu + IOMMU_COMMAND,
-				   IOMMU_CMD_ENABLE_STALL);
-		}
-	}
-	dsb();
-	if (!wait_iommu_status_mask(IOMMU_STATUS_STALL, true, paging_banks))
-		return false;
-	for (n = 0; n < 4; n++)
-		if (saved[n].paging)
-			io_write32(iommu_map(n) + IOMMU_COMMAND,
-				   IOMMU_CMD_DISABLE_PAGING);
-	dsb();
-	if (!wait_iommu_status(IOMMU_STATUS_PAGING, false))
-		return false;
-	for (n = 0; n < 4; n++) {
-		vaddr_t iommu = iommu_map(n);
-
-		io_write32(iommu + IOMMU_DTE, 0);
-		io_write32(iommu + IOMMU_INT_CLEAR, IOMMU_FAULT);
-	}
-	dsb();
-	/* Keep stall active until security attributes and TNB DTE are installed. */
-	return !mmu_fault();
+	return iommu_bases(bases) && tnb_iommu_disable(bases, saved) &&
+	       !mmu_fault();
 }
 
 static bool install_iommu(void)
 {
 	paddr_t dt_pa = virt_to_phys(directory_table);
 	uint32_t dte = make_desc_v2(dt_pa);
+	vaddr_t bases[TNB_IOMMU_BANKS] = { };
 	size_t n = 0;
 
-	for (n = 0; n < 4; n++) {
-		vaddr_t iommu = iommu_map(n);
-
-		if (!iommu)
-			return false;
-		io_write32(iommu + IOMMU_DTE, dte);
-		io_write32(iommu + IOMMU_COMMAND, IOMMU_CMD_ZAP_CACHE);
-		io_write32(iommu + IOMMU_INT_CLEAR, IOMMU_FAULT);
-		io_write32(iommu + IOMMU_INT_MASK, IOMMU_FAULT);
-		io_setbits32(iommu + IOMMU_AUTO_GATING,
-			     IOMMU_DISABLE_FETCH_LIMIT);
-		io_write32(iommu + IOMMU_COMMAND, IOMMU_CMD_ENABLE_PAGING);
-	}
-	dsb();
-	if (!wait_iommu_status(IOMMU_STATUS_PAGING, true) || mmu_fault())
+	if (!iommu_bases(bases) || !tnb_iommu_install(bases, dte) || mmu_fault())
 		return false;
-	for (n = 0; n < 4; n++)
-		if (desc_address_v2(io_read32(iommu_map(n) + IOMMU_DTE)) !=
-		    dt_pa)
+	for (n = 0; n < TNB_IOMMU_BANKS; n++)
+		if (desc_address_v2(io_read32(bases[n] + IOMMU_DTE)) != dt_pa)
 			return false;
-	for (n = 0; n < 4; n++)
-		io_write32(iommu_map(n) + IOMMU_COMMAND,
-			   IOMMU_CMD_DISABLE_STALL);
-	dsb();
-	if (!wait_iommu_status(IOMMU_STATUS_STALL, false))
-		return false;
 	dev.debug[PTA_TNB_DEBUG_DTE_WRITTEN] = dte;
-	for (n = 0; n < 4; n++) {
+	for (n = 0; n < TNB_IOMMU_BANKS; n++) {
 		dev.debug[PTA_TNB_DEBUG_DTE_READBACK0 + n] =
-			io_read32(iommu_map(n) + IOMMU_DTE);
+			io_read32(bases[n] + IOMMU_DTE);
 		dev.debug[PTA_TNB_DEBUG_IOMMU_STATUS0 + n] =
-			io_read32(iommu_map(n) + IOMMU_STATUS);
+			io_read32(bases[n] + IOMMU_STATUS);
 	}
 	return true;
 }
 
-static bool restore_secure(vaddr_t bussgrf, vaddr_t firewall,
-			   const struct tnb_hw_snapshot *before);
-
-static bool restore_iommu(const struct tnb_mmu_save saved[4],
-			  vaddr_t bussgrf, vaddr_t firewall, bool keep_secure)
+static bool restore_iommu(const struct tnb_mmu_save saved[4])
 {
-	size_t n = 0;
+	vaddr_t bases[TNB_IOMMU_BANKS] = { };
 
-	for (n = 0; n < 4; n++) {
-		vaddr_t iommu = iommu_map(n);
-
-		if (!iommu)
-			return false;
-		io_write32(iommu + IOMMU_INT_MASK, 0);
-		io_write32(iommu + IOMMU_COMMAND, IOMMU_CMD_ENABLE_STALL);
-	}
-	dsb();
-	if (!wait_iommu_status(IOMMU_STATUS_STALL, true))
-		return false;
-	for (n = 0; n < 4; n++)
-		io_write32(iommu_map(n) + IOMMU_COMMAND,
-			   IOMMU_CMD_DISABLE_PAGING);
-	dsb();
-	if (!wait_iommu_status(IOMMU_STATUS_PAGING, false))
-		return false;
-	for (n = 0; n < 4; n++) {
-		vaddr_t iommu = iommu_map(n);
-
-		io_write32(iommu + IOMMU_DTE, saved[n].dte);
-		io_write32(iommu + IOMMU_COMMAND, IOMMU_CMD_ZAP_CACHE);
-		io_write32(iommu + IOMMU_AUTO_GATING, saved[n].auto_gating);
-	}
-	dsb();
-	/* Change security attributes before reopening Linux address translation. */
-	if (!keep_secure && !restore_secure(bussgrf, firewall, &dev.before))
-		return false;
-	for (n = 0; n < 4; n++) {
-		if (saved[n].paging)
-			io_write32(iommu_map(n) + IOMMU_COMMAND,
-				   IOMMU_CMD_ENABLE_PAGING);
-	}
-	dsb();
-	if (!wait_iommu_paging(saved))
-		return false;
-	for (n = 0; n < 4; n++) {
-		vaddr_t iommu = iommu_map(n);
-
-		io_write32(iommu + IOMMU_INT_MASK, saved[n].int_mask);
-		io_write32(iommu + IOMMU_COMMAND, IOMMU_CMD_DISABLE_STALL);
-		if (io_read32(iommu + IOMMU_DTE) != saved[n].dte)
-			return false;
-	}
-	dsb();
-	if (!wait_iommu_status(IOMMU_STATUS_STALL, false))
-		return false;
-	return true;
+	return iommu_bases(bases) && tnb_iommu_restore(bases, saved);
 }
 
 static void clear_irq_pending(size_t core)
@@ -972,18 +572,6 @@ static bool irq_state(size_t core, bool *enabled)
 	return true;
 }
 
-static bool wait_irq_mask(vaddr_t gic)
-{
-	uint64_t deadline = timeout_init_us(1000);
-
-	while (io_read32(gic + GICD_CTLR) & GICD_CTLR_RWP) {
-		if (timeout_elapsed(deadline))
-			return false;
-		udelay(1);
-	}
-	return true;
-}
-
 static bool disable_irq(size_t core, bool *enabled)
 {
 	vaddr_t gic = (vaddr_t)phys_to_virt_io(GICD_BASE, GIC_SIZE);
@@ -995,8 +583,6 @@ static bool disable_irq(size_t core, bool *enabled)
 	io_write32(gic + GICD_ICENABLER + (irq / 32) * 4,
 		   BIT(irq % 32));
 	dsb();
-	if (!wait_irq_mask(gic))
-		return false;
 	clear_irq_pending(core);
 	return irq_state(core, &current) && !current;
 }
@@ -1013,8 +599,6 @@ static bool restore_irq(size_t core, bool enabled)
 	io_write32(gic + (enabled ? GICD_ISENABLER : GICD_ICENABLER) +
 		   (irq / 32) * 4, BIT(irq % 32));
 	dsb();
-	if (!enabled && !wait_irq_mask(gic))
-		return false;
 	return irq_state(core, &current) && current == enabled;
 }
 
@@ -1071,7 +655,7 @@ static bool restore_secure(vaddr_t bussgrf, vaddr_t firewall,
 
 static void keep_secure(vaddr_t bussgrf, vaddr_t firewall)
 {
-	bool full = dev.prepare_flags & TNB_FLAG_FULL_SECURITY;
+	bool full = dev.prepare_flags & PTA_TNB_PREPARE_FLAG_FULL_SECURITY;
 	uint32_t mask = full ? 0xf : BUSSGRF_NPU0_MASK;
 
 	io_write32(bussgrf + BUSSGRF_FIREWALL_CON8,
@@ -1123,14 +707,43 @@ static void capture_core_failure_snapshot(
 	snapshot->data_addr = io_read32(npu + NPU_PC_DATA_ADDR);
 }
 
+static void capture_bank_debug(vaddr_t npu, uint32_t index, unsigned phase)
+{
+	dev.debug[index] = io_read32(npu + NPU_CNA_POINTER);
+	dev.debug[index + 1] = io_read32(npu + NPU_CORE_POINTER);
+	dev.debug[index + 2] = io_read32(npu + 0x4004);
+	dev.debug[PTA_TNB_DEBUG_ENABLE_PRE + phase] = io_read32(npu + 0xf008);
+	dev.debug[PTA_TNB_DEBUG_BANK_VALID] |= BIT(phase);
+}
+
+static void capture_address_debug(unsigned phase)
+{
+	static const uint32_t offsets[6] = {
+		0x1070, 0x1110, 0x1040, 0x3010, 0x4004, 0x4020
+	};
+	vaddr_t npu = npu_map(0);
+
+	if (!dev.generic_selected || phase >= 4)
+		return;
+	for (size_t i = 0; i < 6; i++)
+		dev.debug[358 + phase * 6 + i] = io_read32(npu + offsets[i]);
+	dev.debug[382] |= BIT(phase);
+	if (phase == 3)
+		for (size_t i = 0; i < TNB_IOMMU_BANKS; i++)
+			dev.debug[383 + i] = io_read32(iommu_map(i) + IOMMU_DTE);
+}
+
 static void capture_failure_npu_debug(void)
 {
 	size_t n = 0;
 
+	capture_address_debug(3);
+	capture_bank_debug(npu_map(0), PTA_TNB_DEBUG_BANK_FAILURE, 4);
 	memset(&dev.failure_trace, 0, sizeof(dev.failure_trace));
 	dev.failure_trace.valid = 1;
 	dev.failure_trace.sequence = ++last_failure_sequence;
-	dev.failure_trace.mode = dev.mode;
+	dev.failure_trace.template_id = dev.template_id;
+	dev.failure_trace.prepare_flags = dev.prepare_flags;
 	dev.failure_trace.core_count = dev.core_count;
 	dev.failure_trace.complete_mask = dev.completed_mask;
 
@@ -1160,10 +773,13 @@ static uint32_t poll_npus(void)
 	uint64_t deadline = timeout_init_us(TNB_TIMEOUT_US);
 	bool done[PTA_TNB_MAX_CORES] = { false };
 	struct pta_tnb_trace success_trace = {
-		.mode = dev.mode,
+		.template_id = dev.template_id,
+		.prepare_flags = dev.prepare_flags,
 		.core_count = dev.core_count,
 	};
 	size_t complete = 0;
+	uint32_t poll_index = 0, last_irq = 0, last_raw = 0;
+	bool have_sample = false;
 
 	while (!timeout_elapsed(deadline)) {
 		size_t n = 0;
@@ -1184,6 +800,21 @@ static uint32_t poll_npus(void)
 			}
 			status = io_read32(npu + NPU_INT_STATUS);
 			raw = io_read32(npu + NPU_INT_RAW_STATUS);
+			if (!n) {
+				poll_index++;
+				if ((dev.prepare_flags & PTA_TNB_PREPARE_FLAG_TRACE_STEPS) &&
+				    (!have_sample || status != last_irq || raw != last_raw)) {
+					uint32_t count = dev.debug[PTA_TNB_DEBUG_POLL_COUNT];
+					uint32_t index = PTA_TNB_DEBUG_POLL_HISTORY + (count % 8) * 3;
+					dev.debug[index] = poll_index;
+					dev.debug[index + 1] = status;
+					dev.debug[index + 2] = raw;
+					dev.debug[PTA_TNB_DEBUG_POLL_COUNT] = count + 1;
+					last_irq = status;
+					last_raw = raw;
+					have_sample = true;
+				}
+			}
 			dev.npu_status |= status;
 			dev.npu_raw_status |= raw;
 			if (!status || done[n])
@@ -1193,8 +824,20 @@ static uint32_t poll_npus(void)
 				capture_run_status(npu);
 				return PTA_TNB_FAULT_NPU;
 			}
-			capture_core_snapshot(npu, status, raw,
+			if (dev.prepare_flags & PTA_TNB_PREPARE_FLAG_TRACE_STEPS)
+				capture_core_snapshot(npu, status, raw,
 					      &success_trace.core[n]);
+			else {
+				success_trace.core[n].int_status = status;
+				success_trace.core[n].int_raw_status = raw;
+			}
+			if (!n && (dev.prepare_flags & PTA_TNB_PREPARE_FLAG_TRACE_STEPS)) {
+				dev.debug[PTA_TNB_DEBUG_BANK_COMPLETION] = success_trace.core[n].cna_pointer;
+				dev.debug[PTA_TNB_DEBUG_BANK_COMPLETION + 1] = success_trace.core[n].core_pointer;
+				dev.debug[PTA_TNB_DEBUG_BANK_COMPLETION + 2] = io_read32(npu + 0x4004);
+				dev.debug[PTA_TNB_DEBUG_ENABLE_PRE + 3] = io_read32(npu + 0xf008);
+				dev.debug[PTA_TNB_DEBUG_BANK_VALID] |= BIT(3);
+			}
 			io_write32(npu + NPU_INT_CLEAR, NPU_INT_ALL);
 			done[n] = true;
 			dev.completed_mask |= BIT(n);
@@ -1224,25 +867,29 @@ static void capture_npu_debug(vaddr_t npu, uint32_t base)
 	dev.debug[base + 5] = io_read32(npu + NPU_PC_TASK_CONTROL);
 }
 
+static size_t output_work_size(void);
+
 static void capture_output_debug(void)
 {
 	uint32_t words[4] = { };
 	size_t n = 0;
 
-	dcache_inv_range(c_pages, dev.c_size);
-	memcpy(words, c_pages, sizeof(words));
+	dcache_inv_range(output_pages, output_work_size());
+	if (!(dev.prepare_flags & PTA_TNB_PREPARE_FLAG_TRACE_STEPS))
+		return;
+	memcpy(words, output_pages, sizeof(words));
 	for (n = 0; n < 4; n++)
 		dev.debug[PTA_TNB_DEBUG_OUTPUT0 + n] = words[n];
 }
 
-static void capture_command_registers(vaddr_t npu, uint32_t base)
+static void capture_config_addresses(vaddr_t npu, uint32_t base)
 {
-		dev.debug[base + 0] = io_read32(npu + TNB_A_REG);
-	dev.debug[base + 1] = io_read32(npu + TNB_B_REG);
+	dev.debug[base + 0] = io_read32(npu + TNB_INPUT_REG);
+	dev.debug[base + 1] = io_read32(npu + TNB_WEIGHT_REG);
 	dev.debug[base + 2] = io_read32(npu + 0x1040);
 	dev.debug[base + 3] = io_read32(npu + 0x3010);
 	dev.debug[base + 4] = io_read32(npu + 0x4004);
-	dev.debug[base + 5] = io_read32(npu + TNB_C_REG);
+	dev.debug[base + 5] = io_read32(npu + TNB_OUTPUT_REG);
 }
 
 static void fill_status(struct pta_tnb_status *status)
@@ -1266,287 +913,6 @@ static void fill_status(struct pta_tnb_status *status)
 	memcpy(&status->failure, &dev.failure_trace,
 	       sizeof(status->failure));
 	status->profile = profile;
-}
-
-static TEE_Result prepare_gemm(void *session, uint32_t types,
-			       TEE_Param params[TEE_NUM_PARAMS], bool reuse_command,
-			       bool batched)
-{
-	const uint32_t expected = TEE_PARAM_TYPES(
-		batched ? TEE_PARAM_TYPE_MEMREF_INOUT : TEE_PARAM_TYPE_MEMREF_INPUT,
-		TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-		batched ? TEE_PARAM_TYPE_MEMREF_INPUT : TEE_PARAM_TYPE_NONE);
-	struct pta_tnb_batch *batch = params[0].memref.buffer;
-	const struct pta_tnb_gemm *request;
-	TEE_Param buffers[PTA_TNB_MAX_B_INPUTS] = { };
-	uint64_t words[TNB_GEMM_WORDS];
-	uint64_t a_size, b_size, c_size;
-	size_t input_span = 0, output_span = 0;
-	uint64_t *cmd = NULL;
-	TEE_Result res = TEE_SUCCESS;
-	uint64_t profile_start = profile_now();
-	size_t word = 0;
-	uint32_t index;
-	void *a = batched ? NULL : params[1].memref.buffer;
-	uint32_t first_b = TNB_IOVA_B;
-
-	if (types != expected || !params[0].memref.buffer ||
-	    params[0].memref.size != (batched ? sizeof(*batch) : sizeof(*request)))
-		return TEE_ERROR_BAD_PARAMETERS;
-	if (batched) {
-		batch->oom_stage = 3;
-		batch->oom_size = 0;
-		if (!batch->job_count || batch->job_count > PTA_TNB_MAX_JOBS ||
-		    !batch->b_count || batch->b_count > PTA_TNB_MAX_B_INPUTS)
-			return TEE_ERROR_BAD_PARAMETERS;
-		for (index = 0; index < batch->b_count; index++) {
-			buffers[index] = params[index + 1];
-			if (!buffers[index].memref.buffer || !buffers[index].memref.size ||
-			    buffers[index].memref.size > TNB_MAX_B_SIZE ||
-			    ((vaddr_t)buffers[index].memref.buffer & (TNB_PAGE_SIZE - 1)))
-				return TEE_ERROR_BAD_PARAMETERS;
-		}
-		for (index = 0; index < batch->job_count; index++) {
-			const struct pta_tnb_job *job = &batch->job[index];
-			const struct pta_tnb_gemm *g = &job->gemm;
-
-			if (g->abi_version != PTA_TNB_ABI_VERSION ||
-			    g->mode != PTA_TNB_GEMM_W8A8_SINGLE ||
-			    !tnb_gemm_emit(g->m, g->k, g->n, words) ||
-			    job->b_index >= batch->b_count ||
-			    job->b_offset % TNB_PAGE_SIZE ||
-			    (uint64_t)job->b_offset + (uint64_t)g->k * g->n >
-				buffers[job->b_index].memref.size)
-				return TEE_ERROR_BAD_PARAMETERS;
-			input_span = MAX(input_span, ROUNDUP((size_t)g->m * g->k,
-							   TNB_PAGE_SIZE));
-			output_span = MAX(output_span, ROUNDUP((size_t)g->m * g->n *
-							    sizeof(int32_t), TNB_PAGE_SIZE));
-		}
-		request = &batch->job[0].gemm;
-		first_b = b_address(batch->job[0].b_index) + batch->job[0].b_offset;
-	} else {
-		request = params[0].memref.buffer;
-		buffers[0] = params[2];
-		if (request->abi_version != PTA_TNB_ABI_VERSION ||
-		    request->mode != PTA_TNB_GEMM_W8A8_SINGLE ||
-		    !tnb_gemm_emit(request->m, request->k, request->n, words) ||
-		    !params[1].memref.buffer ||
-		    params[1].memref.size != (uint64_t)request->m * request->k ||
-		    !buffers[0].memref.buffer ||
-		    buffers[0].memref.size != (uint64_t)request->k * request->n ||
-		    buffers[0].memref.size > TNB_MAX_B_SIZE ||
-		    ((vaddr_t)buffers[0].memref.buffer & (TNB_PAGE_SIZE - 1)))
-			return TEE_ERROR_BAD_PARAMETERS;
-		input_span = ROUNDUP((size_t)request->m * request->k, TNB_PAGE_SIZE);
-		output_span = ROUNDUP((size_t)request->m * request->n * sizeof(int32_t),
-				      TNB_PAGE_SIZE);
-	}
-	tnb_gemm_emit(request->m, request->k, request->n, words);
-	a_size = (uint64_t)request->m * request->k;
-	b_size = (uint64_t)request->k * request->n;
-	c_size = (uint64_t)request->m * request->n * sizeof(int32_t);
-
-	mutex_lock(&lock);
-	if (dev.state == PTA_TNB_STATE_LOCKED) {
-		res = TEE_ERROR_SECURITY;
-		goto out;
-	}
-	if (dev.state != PTA_TNB_STATE_READY) {
-		res = TEE_ERROR_BAD_STATE;
-		goto out;
-	}
-	dev.prepare_flags = TNB_FLAGS;
-	words[TNB_GEMM_A] = TNB_COMMAND_WITH_VALUE(words[TNB_GEMM_A], TNB_IOVA_A);
-	words[TNB_GEMM_B] = TNB_COMMAND_WITH_VALUE(words[TNB_GEMM_B], first_b);
-	words[TNB_GEMM_C] = TNB_COMMAND_WITH_VALUE(words[TNB_GEMM_C], TNB_IOVA_C);
-	if (reuse_command) {
-		if (!command_page_is_mapped || !command_page_is_uncached) {
-			res = TEE_ERROR_BAD_STATE;
-			goto reset;
-		}
-		for (word = 0; word < TNB_GEMM_WORDS; word++) {
-			if (io_read64((vaddr_t)command_buffer(0) + word * sizeof(uint64_t)) !=
-			    words[word]) {
-				res = TEE_ERROR_BAD_STATE;
-				goto reset;
-			}
-		}
-	}
-	if (!init_uncached_command_page()) {
-		if (batched) {
-			batch->oom_stage = 4;
-			batch->oom_size = PTA_TNB_MAX_CORES * TNB_PAGE_SIZE;
-		}
-		EMSG("OOM_F command_page size=%zu",
-		     (size_t)PTA_TNB_MAX_CORES * TNB_PAGE_SIZE);
-		res = TEE_ERROR_OUT_OF_MEMORY;
-		goto reset;
-	}
-	if (!reuse_command && !set_command_page_uncached(false)) {
-		if (batched) {
-			batch->oom_stage = 5;
-			batch->oom_size = PTA_TNB_MAX_CORES * TNB_PAGE_SIZE;
-		}
-		EMSG("OOM_F command_map size=%zu",
-		     (size_t)PTA_TNB_MAX_CORES * TNB_PAGE_SIZE);
-		res = TEE_ERROR_OUT_OF_MEMORY;
-		goto reset;
-	}
-	clear_work(reuse_command);
-	dev.a_span = input_span;
-	dev.c_span = output_span;
-	dev.batched = batched;
-	if (batched)
-		dev.batch = *batch;
-	for (index = 0; index < PTA_TNB_MAX_B_INPUTS; index++)
-		dev.b_span[index] = buffers[index].memref.size;
-	if (!staging_mm) {
-		staging_mm = phys_mem_ta_alloc(TNB_STAGING_SIZE);
-		if (staging_mm) {
-			staging_pages = phys_to_virt(tee_mm_get_smem(staging_mm),
-				MEM_AREA_SEC_RAM_OVERALL, TNB_STAGING_SIZE);
-			if (!staging_pages) {
-				tee_mm_free(staging_mm);
-				staging_mm = NULL;
-			} else {
-				memset(staging_pages, 0, TNB_STAGING_SIZE);
-				dcache_clean_range(staging_pages, TNB_STAGING_SIZE);
-			}
-		}
-	}
-	if (staging_pages) {
-		a_pages = staging_pages;
-		c_pages = staging_pages + input_span;
-	}
-	if (!a_pages || !c_pages) {
-		if (batched) {
-			batch->oom_stage = !a_pages ? 6 : 7;
-			batch->oom_size = TNB_STAGING_SIZE;
-		}
-		EMSG("OOM_F staging_pool size=%zu", (size_t)TNB_STAGING_SIZE);
-		res = TEE_ERROR_OUT_OF_MEMORY;
-		goto reset;
-	}
-	dev.mode = request->mode;
-	dev.core_count = 1;
-	dev.a_size = a_size;
-	dev.b_size = b_size;
-	dev.c_size = c_size;
-	dev.pte_flags = TNB_PTE_SECURE;
-	dev.command_count[0] = TNB_GEMM_COMMANDS;
-	dev.interrupt_mask[0] = 0x300;
-	cmd = command_buffer(0);
-	if (!reuse_command)
-		memcpy(cmd, words, sizeof(words));
-	memset(a_pages, 0, input_span);
-	if (a)
-		memcpy(a_pages, a, a_size);
-	memset(c_pages, 0, output_span);
-	for (index = 0; index < (batched ? batch->b_count : 1); index++)
-		dcache_clean_range(buffers[index].memref.buffer, dev.b_span[index]);
-	dcache_clean_range(a_pages, input_span);
-	dcache_clean_range(c_pages, output_span);
-	dev.debug[PTA_TNB_DEBUG_FLAGS] = dev.prepare_flags;
-	dev.debug[PTA_TNB_DEBUG_CMD_ADDR] = TNB_IOVA_CMD;
-	dev.debug[PTA_TNB_DEBUG_A_ADDR] = TNB_IOVA_A;
-	dev.debug[PTA_TNB_DEBUG_B_ADDR] = TNB_IOVA_B;
-	dev.debug[PTA_TNB_DEBUG_C_ADDR] = TNB_IOVA_C;
-	dev.debug[PTA_TNB_DEBUG_DT_ADDR] = page_address(directory_table);
-	dev.debug[PTA_TNB_DEBUG_PATCH_A] = TNB_IOVA_A;
-	dev.debug[PTA_TNB_DEBUG_PATCH_B] = TNB_IOVA_B;
-	dev.debug[PTA_TNB_DEBUG_PATCH_C] = TNB_IOVA_C;
-	if (!dev.debug[PTA_TNB_DEBUG_DT_ADDR] ||
-	    !prepare_page_tables(buffers)) {
-		res = TEE_ERROR_GENERIC;
-		goto reset;
-	}
-	if (!reuse_command)
-		dcache_clean_range(cmd, TNB_PAGE_SIZE);
-	dsb();
-	if (!reuse_command && !set_command_page_uncached(true)) {
-		res = TEE_ERROR_GENERIC;
-		goto reset;
-	}
-	dev.owner = session;
-	dev.stage = PTA_TNB_STAGE_PREPARED;
-	dev.fault = PTA_TNB_FAULT_NONE;
-	dev.state = PTA_TNB_STATE_PREPARED;
-	goto out;
-reset:
-	clear_work(false);
-	memset(&dev, 0, sizeof(dev));
-out:
-	profile_add(&profile.prepare_calls, &profile.prepare_ticks,
-		    profile_start);
-	mutex_unlock(&lock);
-	return res;
-}
-
-/* Change a job's contents, never its mappings or backing, while ACTIVE. */
-static TEE_Result update_gemm(void *session, uint32_t types,
-			      TEE_Param params[TEE_NUM_PARAMS])
-{
-	const uint32_t expected = TEE_PARAM_TYPES(
-		TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	const struct pta_tnb_gemm *request = NULL;
-	uint64_t words[TNB_GEMM_WORDS];
-	uint32_t index = params[0].value.a;
-	TEE_Result res = TEE_SUCCESS;
-	size_t word = 0;
-	uint32_t b_iova;
-	uint32_t m = params[0].value.b;
-
-	if (types != expected || index >= PTA_TNB_MAX_JOBS ||
-	    !params[1].memref.buffer)
-		return TEE_ERROR_BAD_PARAMETERS;
-	mutex_lock(&lock);
-	if (dev.state == PTA_TNB_STATE_LOCKED) {
-		res = TEE_ERROR_SECURITY;
-		goto out;
-	}
-	if (dev.owner != session || dev.state != PTA_TNB_STATE_ACTIVE ||
-	    !dev.batched) {
-		res = TEE_ERROR_BAD_STATE;
-		goto out;
-	}
-	if (index >= dev.batch.job_count) {
-		res = TEE_ERROR_BAD_PARAMETERS;
-		goto out;
-	}
-	request = &dev.batch.job[index].gemm;
-	b_iova = b_address(dev.batch.job[index].b_index) + dev.batch.job[index].b_offset;
-	if (!m || m > request->m ||
-	    params[1].memref.size != (size_t)m * request->k ||
-	    !tnb_gemm_emit(m, request->k, request->n, words)) {
-		res = TEE_ERROR_BAD_PARAMETERS;
-		goto out;
-	}
-	words[TNB_GEMM_A] = TNB_COMMAND_WITH_VALUE(words[TNB_GEMM_A], TNB_IOVA_A);
-	words[TNB_GEMM_B] = TNB_COMMAND_WITH_VALUE(words[TNB_GEMM_B], b_iova);
-	words[TNB_GEMM_C] = TNB_COMMAND_WITH_VALUE(words[TNB_GEMM_C], TNB_IOVA_C);
-	/* The existing uncached CPU mapping stays in place for the whole window. */
-	for (word = 0; word < TNB_GEMM_WORDS; word++)
-		io_write64((vaddr_t)command_buffer(0) + word * sizeof(uint64_t),
-			   words[word]);
-	memset(a_pages, 0, dev.a_span);
-	memcpy(a_pages, params[1].memref.buffer, params[1].memref.size);
-	dcache_cleaninv_range(c_pages, dev.c_span);
-	memset(c_pages, 0, dev.c_span);
-	dcache_clean_range(a_pages, dev.a_span);
-	dcache_clean_range(c_pages, dev.c_span);
-	dsb();
-	dev.a_size = m * request->k;
-	dev.b_size = request->k * request->n;
-	dev.c_size = m * request->n * sizeof(int32_t);
-	dev.debug[PTA_TNB_DEBUG_B_ADDR] = b_iova;
-	dev.debug[PTA_TNB_DEBUG_PATCH_B] = b_iova;
-	dev.debug[PTA_TNB_DEBUG_PTE_B] =
-		page_table_for_iova(b_iova)[pte_index(b_iova)];
-out:
-	mutex_unlock(&lock);
-	return res;
 }
 
 static void pulse_npu_resets(void)
@@ -1590,6 +956,8 @@ static void enter_locked(uint32_t fault)
 	dev.state = PTA_TNB_STATE_LOCKED;
 	dev.owner = NULL;
 	dev.fault = fault;
+	dev.template_id = 0;
+	dev.weight_buffer = NULL;
 	for (n = 0; n < PTA_TNB_MAX_CORES; n++) {
 		vaddr_t npu = npu_map(n);
 
@@ -1610,20 +978,12 @@ static TEE_Result get_caps(uint32_t types, TEE_Param params[TEE_NUM_PARAMS])
 	struct pta_tnb_caps caps = {
 		.abi_version = PTA_TNB_ABI_VERSION,
 		.features = PTA_TNB_CAP_CALLER_BOUND | PTA_TNB_CAP_IOMMU_V2 |
-			    PTA_TNB_CAP_SECURE_PTE |
-			    PTA_TNB_CAP_FULL_SECURITY |
-			    PTA_TNB_CAP_PROFILE | PTA_TNB_CAP_GEMM
-#ifdef CFG_TNB_SECURITY_TEST
-			    | PTA_TNB_CAP_SECURE_RAM_TEST
-#endif
-			    ,
-		.max_modes = 1,
+                    PTA_TNB_CAP_SECURE_PTE | PTA_TNB_CAP_FULL_SECURITY |
+                    PTA_TNB_CAP_NONSECURE_WEIGHT | PTA_TNB_CAP_MULTI_PAGE_IO |
+                    PTA_TNB_CAP_MULTI_CORE | PTA_TNB_CAP_PROFILE |
+                    PTA_TNB_CAP_GENERIC_GEMM,
+        .max_templates = 0,
 		.max_tensors = 3,
-		.mode = PTA_TNB_GEMM_W8A8_SINGLE,
-		.n_min = TNB_GEMM_N_MIN,
-		.n_max = TNB_GEMM_N_MAX,
-		.n_align = TNB_GEMM_N_ALIGN,
-		.b_max = TNB_GEMM_B_MAX,
 		.reserved = { PTA_TNB_BUILD_ID },
 	};
 	const uint32_t expected =
@@ -1642,6 +1002,307 @@ static TEE_Result get_caps(uint32_t types, TEE_Param params[TEE_NUM_PARAMS])
 	return TEE_SUCCESS;
 }
 
+/* Translate each virtual page independently: TA/shared buffers need not
+ * have physically contiguous backing.
+ */
+static bool buffer_in_area(const void *buffer, size_t size, uint32_t area)
+{
+	vaddr_t address = (vaddr_t)buffer;
+
+	if (!buffer || !size || size > UINTPTR_MAX - address)
+		return false;
+	while (size) {
+		size_t span = MIN(size, TNB_PAGE_SIZE - (address & (TNB_PAGE_SIZE - 1)));
+		paddr_t pa = virt_to_phys((void *)address);
+
+		if (!pa || !core_pbuf_is(area, pa, span))
+			return false;
+		address += span;
+		size -= span;
+	}
+	return true;
+}
+
+/* The trusted caller keeps A/B backing alive through CLOSE. B is public,
+ * page-aligned and page-rounded; A and the RUN output remain secure.
+ */
+/* Caller holds lock; descriptor and buffers have already been validated. */
+static TEE_Result load_generic_gemm(void *session,
+    const struct pta_tnb_gemm *gemm)
+{
+    uint64_t tick;
+    bool cold = !fixed_tables_ready;
+
+    if (dev.state == PTA_TNB_STATE_LOCKED)
+        return TEE_ERROR_SECURITY;
+    if (dev.state != PTA_TNB_STATE_READY)
+        return TEE_ERROR_BAD_STATE;
+    dev.core_count = 1;
+    dev.prepare_flags = PTA_TNB_PREPARE_FLAG_SECURE_PTE |
+        PTA_TNB_PREPARE_FLAG_FULL_SECURITY | PTA_TNB_PREPARE_FLAG_NONSECURE_WEIGHT;
+    dev.pte_flags = TNB_PTE_SECURE;
+    dev.input_size = gemm->m * gemm->k;
+    dev.weight_size = gemm->k * gemm->n;
+    dev.output_size = gemm->m * gemm->n * sizeof(int32_t);
+    memset(dev.debug, 0, sizeof(dev.debug));
+    dev.debug[PTA_TNB_DEBUG_FLAGS] = dev.prepare_flags;
+    dev.debug[PTA_TNB_DEBUG_INPUT_ADDR] = TNB_IOVA_INPUT;
+    dev.debug[PTA_TNB_DEBUG_WEIGHT_ADDR] = TNB_IOVA_WEIGHT;
+    dev.debug[PTA_TNB_DEBUG_OUTPUT_ADDR] = TNB_IOVA_OUTPUT;
+    dev.debug[PTA_TNB_DEBUG_DT_ADDR] = page_address(directory_table);
+    dev.debug[PTA_TNB_DEBUG_PATCH_INPUT] = TNB_IOVA_INPUT;
+    dev.debug[PTA_TNB_DEBUG_PATCH_WEIGHT] = TNB_IOVA_WEIGHT;
+    dev.debug[PTA_TNB_DEBUG_PATCH_OUTPUT] = TNB_IOVA_OUTPUT;
+    if (!dev.debug[PTA_TNB_DEBUG_DT_ADDR] || !secure_page(directory_table) ||
+        !prepare_fixed_page_tables()) {
+        clear_work();
+        memset(&dev, 0, sizeof(dev));
+        return TEE_ERROR_BAD_PARAMETERS;
+    }
+    if (cold) {
+        tick = profile_now();
+        dcache_clean_range(input_pages, sizeof(input_pages));
+        dcache_clean_range(output_pages, sizeof(output_pages));
+        dsb();
+        batch_profile.begin_clean_ticks += profile_now() - tick;
+    }
+    dev.interrupt_mask[0] = 0x300;
+    dev.template_id = PTA_TNB_TEMPLATE_GENERIC;
+    record_generic_work();
+    dev.owner = session;
+    dev.stage = PTA_TNB_STAGE_PREPARED;
+    dev.fault = PTA_TNB_FAULT_NONE;
+    dev.state = PTA_TNB_STATE_PREPARED;
+    return TEE_SUCCESS;
+}
+
+/* Both B ranges are mapped before ACTIVATE. The outer trusted invocation
+ * retains their backing until CLOSE; no ACTIVE page-table update is allowed.
+ */
+
+/* Three independent public B windows, mapped once before ACTIVATE. */
+
+static void release_registered_weights(struct tnb_session *ctx)
+{
+    while (ctx->weights) {
+        struct tnb_registered_weight *weight = ctx->weights;
+        ctx->weights = weight->next;
+        for (size_t n = 0; n < weight->count; n++) {
+            memset(registered_pt[weight->first + n], 0, TNB_PAGE_SIZE);
+            registered_pt_used[weight->first + n] = false;
+        }
+        mobj_put(weight->mobj);
+        free(weight);
+    }
+}
+
+/* Registration is restricted to a trusted caller and owns the backing mobj.
+ * Contents of public B are not immutable; registration fixes page identity. */
+static TEE_Result register_weight(void *session, uint32_t types,
+                                 TEE_Param params[TEE_NUM_PARAMS])
+{
+    struct tnb_session *ctx = session;
+    struct tnb_registered_weight *weight = NULL;
+    struct mobj *mobj = NULL;
+    size_t offs = 0, size = params[0].memref.size, n, first, count;
+    TEE_Result res = TEE_ERROR_BAD_PARAMETERS;
+    uint64_t start = profile_now();
+
+    if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+                                TEE_PARAM_TYPE_VALUE_OUTPUT, 0, 0) ||
+        !size || size > SIZE_M(12) || (size & (TNB_PAGE_SIZE - 1)) ||
+        !caller_buffer_mobj(params[0].memref.buffer, size, &mobj, &offs))
+        return res;
+    mutex_lock(&lock);
+    if (dev.state != PTA_TNB_STATE_READY) {
+        res = TEE_ERROR_BAD_STATE;
+        goto out;
+    }
+    for (weight = ctx->weights; weight; weight = weight->next)
+        if (weight->mobj == mobj && weight->offset == offs && weight->size == size) {
+            params[1].value.a = weight->handle;
+            params[1].value.b = 0;
+            res = TEE_SUCCESS;
+            goto out;
+        }
+    count = ROUNDUP(size, SIZE_M(4)) / SIZE_M(4);
+    for (first = 0; first + count <= TNB_REGISTERED_PT_PAGES; first++) {
+        for (n = 0; n < count && !registered_pt_used[first + n]; n++)
+            ;
+        if (n == count)
+            break;
+    }
+    res = TEE_ERROR_OUT_OF_MEMORY;
+    if (first + count > TNB_REGISTERED_PT_PAGES || next_weight_handle == UINT32_MAX)
+        goto out;
+    weight = calloc(1, sizeof(*weight));
+    if (!weight)
+        goto out;
+    for (n = 0; n < count; n++) {
+        if (!secure_page(registered_pt[first + n]))
+            goto invalid;
+        weight->table_pa[n] = virt_to_phys(registered_pt[first + n]);
+        memset(registered_pt[first + n], 0, TNB_PAGE_SIZE);
+    }
+    for (n = 0; n < size / TNB_PAGE_SIZE; n++) {
+        paddr_t pa = 0;
+        if (mobj_get_pa(mobj, offs + n * TNB_PAGE_SIZE, TNB_PAGE_SIZE, &pa) ||
+            !pa || (pa & (TNB_PAGE_SIZE - 1)) || pa >= BIT64(40) ||
+            !core_pbuf_is(CORE_MEM_NON_SEC, pa, TNB_PAGE_SIZE))
+            goto invalid;
+        registered_pt[first + n / TNB_PT_ENTRIES][n % TNB_PT_ENTRIES] =
+            make_desc_v2(pa) | TNB_PTE_READ;
+    }
+    weight->mobj = mobj_get(mobj);
+    if (!weight->mobj)
+        goto invalid;
+    weight->offset = offs;
+    weight->size = size;
+    weight->first = first;
+    weight->count = count;
+    weight->handle = ++next_weight_handle;
+    dcache_clean_range(params[0].memref.buffer, size);
+    dcache_clean_range(registered_pt[first], count * TNB_PAGE_SIZE);
+    dsb();
+    for (n = 0; n < count; n++)
+        registered_pt_used[first + n] = true;
+    weight->next = ctx->weights;
+    ctx->weights = weight;
+    params[1].value.a = weight->handle;
+    params[1].value.b = 0;
+    profile_add(&batch_profile.register_calls, &batch_profile.register_ticks, start);
+    batch_profile.register_pages += size / TNB_PAGE_SIZE;
+    batch_profile.register_cache_bytes += size;
+    res = TEE_SUCCESS;
+    goto out;
+invalid:
+    free(weight);
+    res = TEE_ERROR_BAD_PARAMETERS;
+out:
+    mutex_unlock(&lock);
+    return res;
+}
+
+/* The cache contains only trusted, unbound generator output. Weight handles,
+ * backing and address bindings are validated anew on every BEGIN/RUN.
+ * Caller holds the core lock. Four entries bound per-session heap use. */
+static TEE_Result get_registered_plan(struct tnb_session *ctx,
+        const struct pta_tnb_gemm_batch *batch, struct tnb_generic_plan **out)
+{
+    struct tnb_generic_plan *plan;
+    size_t bytes = batch->count * sizeof(batch->job[0]);
+
+    if (!ctx->plans) {
+        ctx->plans = calloc(TNB_GENERIC_PLAN_CACHE_COUNT, sizeof(*ctx->plans));
+        if (!ctx->plans)
+            return TEE_ERROR_OUT_OF_MEMORY;
+    }
+    for (uint32_t i = 0; i < TNB_GENERIC_PLAN_CACHE_COUNT; i++) {
+        plan = &ctx->plans[i];
+        if (plan->valid && plan->batch.count == batch->count &&
+            !memcmp(plan->batch.job, batch->job, bytes)) {
+            *out = plan;
+            return TEE_SUCCESS;
+        }
+    }
+    plan = &ctx->plans[ctx->next_plan];
+    plan->valid = false;
+    for (uint32_t i = 0; i < batch->count; i++) {
+        const struct pta_tnb_gemm *g = &batch->job[i].gemm;
+        if (!tnb_gemm_emit(g->m, g->k, g->n, plan->config[i]))
+            return TEE_ERROR_BAD_PARAMETERS;
+    }
+    plan->batch = *batch;
+    plan->valid = true;
+    ctx->next_plan = (ctx->next_plan + 1) % TNB_GENERIC_PLAN_CACHE_COUNT;
+    *out = plan;
+    return TEE_SUCCESS;
+}
+
+/* No weight memref crosses this boundary. Only small session-owned handles
+ * and a semantic batch descriptor are consumed in the steady-state path. */
+static TEE_Result prepare_registered_batch(void *session, uint32_t types,
+                                          TEE_Param params[TEE_NUM_PARAMS])
+{
+    struct tnb_session *ctx = session;
+    struct tnb_registered_weight *weights[3] = { };
+    struct pta_tnb_gemm_batch batch = { };
+    struct tnb_generic_plan *plan = NULL;
+    TEE_Result res = TEE_ERROR_BAD_PARAMETERS;
+    size_t i, n;
+    uint64_t start = profile_now(), tick;
+
+    if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+            TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_VALUE_INPUT,
+            TEE_PARAM_TYPE_VALUE_INPUT) || !params[0].memref.buffer ||
+        params[0].memref.size != sizeof(batch))
+        return res;
+    memcpy(&batch, params[0].memref.buffer, sizeof(batch));
+    if (!batch.count || batch.count > PTA_TNB_GEMM_MAX_JOBS || batch.reserved)
+        return res;
+    mutex_lock(&lock);
+    if (dev.state != PTA_TNB_STATE_READY) {
+        res = dev.state == PTA_TNB_STATE_LOCKED ? TEE_ERROR_SECURITY : TEE_ERROR_BAD_STATE;
+        goto out;
+    }
+    for (i = 0; i < 3; i++) {
+        if (params[i + 1].value.b)
+            goto out;
+        for (weights[i] = ctx->weights; weights[i]; weights[i] = weights[i]->next)
+            if (weights[i]->handle == params[i + 1].value.a)
+                break;
+        if (!weights[i])
+            goto out;
+    }
+    for (i = 0; i < batch.count; i++) {
+        const struct pta_tnb_gemm_job *job = &batch.job[i];
+        const struct pta_tnb_gemm *g = &job->gemm;
+        if (g->abi_version != PTA_TNB_ABI_VERSION ||
+            g->mode != PTA_TNB_GEMM_MODE_W8A8 || g->reserved[0] ||
+            g->reserved[1] || g->reserved[2] ||
+            job->b_index >= 3 || (job->b_offset & (TNB_PAGE_SIZE - 1)) ||
+            (uint64_t)job->b_offset + (uint64_t)g->k * g->n > weights[job->b_index]->size)
+            goto out;
+    }
+    res = get_registered_plan(ctx, &batch, &plan);
+    if (res)
+        goto out;
+    tick = profile_now();
+    res = load_generic_gemm(session, &batch.job[0].gemm);
+    batch_profile.setup_ticks += profile_now() - tick;
+    if (res)
+        goto out;
+    for (i = 0; i < 3; i++)
+        for (n = 0; n < 3; n++)
+            directory_table[dte_index(TNB_IOVA_WEIGHT_SLOT(i) + n * SIZE_M(4))] =
+                n < weights[i]->count ? make_desc_v2(weights[i]->table_pa[n]) : 0;
+    for (i = 0; i < batch.count; i++) {
+        dev.generic_gemm[i] = batch.job[i].gemm;
+        dev.generic_b[i] = batch.job[i].b_index;
+        dev.generic_offset[i] = batch.job[i].b_offset;
+        memcpy(dev.generic_config[i], plan->config[i],
+               sizeof(dev.generic_config[i]));
+    }
+    dev.generic_count = batch.count;
+    dev.debug[PTA_TNB_DEBUG_PTE_WEIGHT] = registered_pt[weights[0]->first][0];
+    dcache_clean_range(directory_table, sizeof(directory_table));
+    dsb();
+out:
+    profile_add(&batch_profile.calls, &batch_profile.ticks, start);
+    mutex_unlock(&lock);
+    return res;
+}
+
+/* Select trusted config in a stable ACTIVE address space. Only
+ * CPU config and A/C data change; DTE/PTE/IOMMU remain untouched.
+ */
+static size_t output_work_size(void)
+{
+    if (dev.template_id != PTA_TNB_TEMPLATE_GENERIC)
+        return sizeof(output_pages);
+    return ROUNDUP(dev.output_size, TNB_PAGE_SIZE);
+}
+
 static TEE_Result activate(void *session, uint32_t types)
 {
 	const uint32_t expected =
@@ -1649,7 +1310,6 @@ static TEE_Result activate(void *session, uint32_t types)
 				TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
 	vaddr_t bussgrf = io_map(BUSSGRF_BASE, BUSSGRF_SIZE);
 	vaddr_t firewall = io_map(FIREWALL_DDR_BASE, FIREWALL_DDR_SIZE);
-	struct tnb_hw_snapshot before = { };
 	TEE_Result res = TEE_SUCCESS;
 	uint64_t profile_start = profile_now();
 	size_t n = 0;
@@ -1662,20 +1322,11 @@ static TEE_Result activate(void *session, uint32_t types)
 		goto out;
 	}
 	if (dev.owner != session || dev.state != PTA_TNB_STATE_PREPARED ||
-	    snapshot(&before)) {
+		    snapshot(&dev.before)) {
 		res = TEE_ERROR_BAD_STATE;
 		goto out;
 	}
-	if (!dev.secure_held) {
-		dev.before = before;
-	} else {
-		/* Preserve the original security baseline; refresh Linux MMU state. */
-		memcpy(dev.before.iommu_dte, before.iommu_dte,
-		       sizeof(before.iommu_dte));
-		memcpy(dev.before.iommu_status, before.iommu_status,
-		       sizeof(before.iommu_status));
-	}
-	for (n = 0; n < dev.core_count; n++) {
+	for (n = 0; n < PTA_TNB_MAX_CORES; n++) {
 		vaddr_t npu = npu_map(n);
 
 		if (!npu) {
@@ -1684,10 +1335,27 @@ static TEE_Result activate(void *session, uint32_t types)
 		}
 		dev.old_npu_mask[n] = io_read32(npu + NPU_INT_MASK);
 	}
-	for (n = 0; n < dev.core_count; n++) {
-		/* The masked-handoff diagnostic retains the first saved IRQ state. */
-		if (dev.irq_held)
-			break;
+	/* Test-only: save all restoration inputs before any device mutation. */
+	for (n = 0; n < TNB_IOMMU_BANKS; n++) {
+		vaddr_t mmu = iommu_map(n);
+
+		if (!mmu) {
+			res = TEE_ERROR_GENERIC;
+			goto out;
+		}
+		dev.mmu[n].dte = dev.before.iommu_dte[n];
+		dev.mmu[n].paging = !!(dev.before.iommu_status[n] & IOMMU_STATUS_PAGING);
+		dev.mmu[n].int_mask = io_read32(mmu + IOMMU_INT_MASK);
+		dev.mmu[n].auto_gating = io_read32(mmu + IOMMU_AUTO_GATING);
+	}
+	for (n = 0; n < PTA_TNB_MAX_CORES; n++)
+		if (!irq_state(n, &dev.irq_enabled[n])) {
+			res = TEE_ERROR_GENERIC;
+			goto out;
+		}
+	/* IOMMU takeover includes all four banks, including NPU1/2, even
+	 * when only core0 executes. Protect every shared NPU/IOMMU IRQ. */
+	for (n = 0; n < PTA_TNB_MAX_CORES; n++) {
 		if (!disable_irq(n, &dev.irq_enabled[n])) {
 			size_t restore_count = n + 1;
 
@@ -1696,17 +1364,15 @@ static TEE_Result activate(void *session, uint32_t types)
 				if (!restore_irq(restore_count,
 						 dev.irq_enabled[restore_count]))
 					res = TEE_ERROR_SECURITY;
+			if (res == TEE_ERROR_SECURITY)
+				enter_locked(PTA_TNB_FAULT_IRQ);
 			goto out;
 		}
 	}
 	dev.stage = PTA_TNB_STAGE_IRQ;
-	if (!disable_iommu(dev.mmu)) {
-		enter_locked(PTA_TNB_FAULT_IOMMU);
-		res = TEE_ERROR_SECURITY;
-		goto out;
-	}
-	if (!dev.secure_held && !set_secure(bussgrf, firewall,
-			dev.prepare_flags & TNB_FLAG_FULL_SECURITY)) {
+	dev.security_touched = true;
+	if (!set_secure(bussgrf, firewall,
+			dev.prepare_flags & PTA_TNB_PREPARE_FLAG_FULL_SECURITY)) {
 		enter_locked(PTA_TNB_FAULT_SECURE);
 		res = TEE_ERROR_SECURITY;
 		goto out;
@@ -1722,6 +1388,11 @@ static TEE_Result activate(void *session, uint32_t types)
 	dev.debug[PTA_TNB_DEBUG_DDR_MST32] =
 		io_read32(firewall + FIREWALL_DDR_MST(32));
 	dev.stage = PTA_TNB_STAGE_SECURE;
+	if (!disable_iommu(dev.mmu)) {
+		enter_locked(PTA_TNB_FAULT_IOMMU);
+		res = TEE_ERROR_SECURITY;
+		goto out;
+	}
 	if (!install_iommu()) {
 		enter_locked(PTA_TNB_FAULT_IOMMU);
 		res = TEE_ERROR_SECURITY;
@@ -1736,30 +1407,19 @@ out:
 	return res;
 }
 
-static uint32_t command_address(size_t core)
-{
-	return TNB_IOVA_CMD_CORE(core);
-}
+
+
 
 static bool prepare_npu_core(size_t core)
 {
 	vaddr_t npu = npu_map(core);
-	uint32_t address = command_address(core);
 
-	if (!npu || !address || core >= dev.core_count)
+	if (!npu || core >= dev.core_count ||
+	    !dev.generic_count)
 		return false;
-	io_write32(npu + NPU_PC_DATA_ADDR, 1);
-	dsb();
-	io_write32(npu + NPU_CNA_POINTER, 0xe + 0x10000000 * core);
-	io_write32(npu + NPU_CORE_POINTER, 0xe + 0x10000000 * core);
-	io_write32(npu + NPU_PC_DATA_ADDR, address);
-	io_write32(npu + NPU_PC_DATA_AMOUNT,
-		   (dev.command_count[core] + TNB_TRAILER_COUNT + 1) / 2 - 1);
-	io_write32(npu + NPU_INT_MASK, dev.interrupt_mask[core]);
-	io_write32(npu + NPU_INT_CLEAR, NPU_INT_ALL);
-	/* Match the RK3588 PC driver: one task, ping-pong disabled. */
-	io_write32(npu + NPU_PC_TASK_CONTROL, 0x6001);
-	io_write32(npu + NPU_PC_DMA_BASE_ADDR, 0);
+
+	tnb_npu_prepare(npu, core, config[core],
+			dev.interrupt_mask[core]);
 	return true;
 }
 
@@ -1769,34 +1429,24 @@ static bool trigger_npu_core(size_t core)
 
 	if (!npu)
 		return false;
-	io_write32(npu + NPU_PC_OP_EN, 1);
-	dsb();
-	io_write32(npu + NPU_PC_OP_EN, 0);
-	dsb();
+	tnb_npu_start(npu);
 	return true;
 }
 
-static TEE_Result run(void *session, uint32_t types,
-			      TEE_Param params[TEE_NUM_PARAMS])
+static TEE_Result run_locked(void *session, TEE_Param *output)
 {
-	const uint32_t expected =
-		TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT,
-				TEE_PARAM_TYPE_MEMREF_OUTPUT,
-				TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	struct pta_tnb_status status = { };
 	vaddr_t npu = npu_map(0);
 	TEE_Result res = TEE_SUCCESS;
 	uint64_t profile_start = profile_now();
 	uint64_t poll_start = 0;
 	size_t n = 0;
+	bool trace = dev.prepare_flags & PTA_TNB_PREPARE_FLAG_TRACE_STEPS;
 
-	if (types != expected || !npu)
+	if (!npu)
 		return TEE_ERROR_BAD_PARAMETERS;
-	if (params[0].memref.size < dev.c_size ||
-	    params[1].memref.size < sizeof(status))
+	if (output->memref.size < dev.output_size)
 		return TEE_ERROR_SHORT_BUFFER;
 
-	mutex_lock(&lock);
 	if (dev.state == PTA_TNB_STATE_LOCKED) {
 		res = TEE_ERROR_SECURITY;
 		goto out;
@@ -1805,6 +1455,17 @@ static TEE_Result run(void *session, uint32_t types,
 		res = TEE_ERROR_BAD_STATE;
 		goto out;
 	}
+	if (dev.template_id == PTA_TNB_TEMPLATE_GENERIC &&
+	    (!(*output).memref.buffer ||
+	     !buffer_in_area((*output).memref.buffer, dev.output_size, CORE_MEM_SEC))) {
+		res = TEE_ERROR_BAD_PARAMETERS;
+		goto out;
+	}
+	if (dev.generic_count && !dev.generic_selected) {
+		res = TEE_ERROR_BAD_STATE;
+		goto out;
+	}
+	/* Experiment only: reuse the initially selected GEMM. */
 	dev.state = PTA_TNB_STATE_RUNNING;
 	dev.npu_status = 0;
 	dev.npu_raw_status = 0;
@@ -1820,8 +1481,16 @@ static TEE_Result run(void *session, uint32_t types,
 	dev.debug[PTA_TNB_DEBUG_PTE_FLAGS] = dev.pte_flags;
 	dev.debug[PTA_TNB_DEBUG_NPU_MASK] =
 		io_read32(npu + NPU_INT_MASK);
-	capture_npu_debug(npu, PTA_TNB_DEBUG_PRE_STATUS);
-	capture_command_registers(npu, PTA_TNB_DEBUG_PRE_CMD_INPUT);
+	memset(dev.debug + PTA_TNB_DEBUG_BANK_PRE, 0, 46 * sizeof(uint32_t));
+	if (trace)
+		capture_bank_debug(npu, PTA_TNB_DEBUG_BANK_PRE, 0);
+	if (trace)
+		capture_npu_debug(npu, PTA_TNB_DEBUG_PRE_STATUS);
+	dev.debug[382] = 0;
+	if (trace)
+		capture_address_debug(0);
+	if (trace)
+		capture_config_addresses(npu, PTA_TNB_DEBUG_PRE_CMD_INPUT);
 	for (n = 0; n < dev.core_count; n++)
 		if (!prepare_npu_core(n)) {
 			capture_failure_npu_debug();
@@ -1829,12 +1498,19 @@ static TEE_Result run(void *session, uint32_t types,
 			res = TEE_ERROR_SECURITY;
 			goto out;
 		}
+	if (dev.prepare_flags & PTA_TNB_PREPARE_FLAG_TRACE_STEPS) {
+		dsb();
+		dev.debug[PTA_TNB_DEBUG_AFTER_CONTROL] =
+			io_read32(npu + NPU_PC_TASK_CONTROL);
+		dev.debug[PTA_TNB_DEBUG_AFTER_CONTROL_TASK] =
+			io_read32(npu + NPU_PC_TASK_STATUS);
+	}
 	dsb();
-	dev.debug[PTA_TNB_DEBUG_AFTER_CONTROL] =
-		io_read32(npu + NPU_PC_TASK_CONTROL);
-	dev.debug[PTA_TNB_DEBUG_AFTER_CONTROL_TASK] =
-		io_read32(npu + NPU_PC_TASK_STATUS);
-	dsb();
+	/* Experiment: PRE_CMD words now hold prepared/pre-OP_EN PC state. */
+	if (trace)
+		capture_npu_debug(npu, PTA_TNB_DEBUG_PRE_CMD_INPUT);
+	if (trace)
+		capture_bank_debug(npu, PTA_TNB_DEBUG_BANK_PREPARED, 1);
 	for (n = 0; n < dev.core_count; n++)
 		if (!trigger_npu_core(n)) {
 			capture_failure_npu_debug();
@@ -1842,11 +1518,13 @@ static TEE_Result run(void *session, uint32_t types,
 			res = TEE_ERROR_SECURITY;
 			goto out;
 		}
-	dsb();
-	dev.debug[PTA_TNB_DEBUG_AFTER_OP_ENABLE] =
-		io_read32(npu + NPU_PC_TASK_CONTROL);
-	dev.debug[PTA_TNB_DEBUG_AFTER_OP_ENABLE_TASK] =
-		io_read32(npu + NPU_PC_TASK_STATUS);
+	if (dev.prepare_flags & PTA_TNB_PREPARE_FLAG_TRACE_STEPS) {
+		dsb();
+		dev.debug[PTA_TNB_DEBUG_AFTER_OP_ENABLE] =
+			io_read32(npu + NPU_PC_TASK_CONTROL);
+		dev.debug[PTA_TNB_DEBUG_AFTER_OP_ENABLE_TASK] =
+			io_read32(npu + NPU_PC_TASK_STATUS);
+	}
 	dsb();
 	dev.debug[PTA_TNB_DEBUG_OP_ENABLE_READBACK] =
 		io_read32(npu + NPU_PC_OP_EN);
@@ -1854,7 +1532,12 @@ static TEE_Result run(void *session, uint32_t types,
 		io_read32(npu + NPU_CNA_POINTER);
 	dev.debug[PTA_TNB_DEBUG_CORE_POINTER] =
 		io_read32(npu + NPU_CORE_POINTER);
-	capture_npu_debug(npu, PTA_TNB_DEBUG_POST_STATUS);
+	if (trace)
+		capture_npu_debug(npu, PTA_TNB_DEBUG_POST_STATUS);
+	if (trace)
+		capture_bank_debug(npu, PTA_TNB_DEBUG_BANK_LAUNCH, 2);
+	if (trace)
+		capture_address_debug(1);
 	dev.stage = PTA_TNB_STAGE_SUBMITTED;
 	poll_start = profile_now();
 	dev.fault = poll_npus();
@@ -1864,10 +1547,15 @@ static TEE_Result run(void *session, uint32_t types,
 			io_read32(npu + NPU_CNA_POINTER);
 		dev.debug[PTA_TNB_DEBUG_CORE_POINTER] =
 			io_read32(npu + NPU_CORE_POINTER);
-		capture_command_registers(npu, PTA_TNB_DEBUG_POST_CMD_INPUT);
+		if (trace)
+			capture_config_addresses(npu, PTA_TNB_DEBUG_POST_CMD_INPUT);
+		if (trace)
+			capture_address_debug(2);
 		capture_output_debug();
 	}
 	if (dev.fault) {
+		/* Preserve command-written registers before LOCKED resets the NPU. */
+		capture_config_addresses(npu, PTA_TNB_DEBUG_POST_CMD_INPUT);
 		enter_locked(dev.fault);
 		res = TEE_ERROR_SECURITY;
 		goto out;
@@ -1885,130 +1573,145 @@ static TEE_Result run(void *session, uint32_t types,
 		dev.completed_trace.sequence = ++last_success_sequence;
 		last_success_trace = dev.completed_trace;
 	}
-	memcpy(params[0].memref.buffer, c_pages, dev.c_size);
-	params[0].memref.size = dev.c_size;
+	memcpy((*output).memref.buffer, output_pages, dev.output_size);
+	(*output).memref.size = dev.output_size;
 	dev.state = PTA_TNB_STATE_ACTIVE;
 out:
 	profile_add(&profile.run_calls, &profile.run_ticks, profile_start);
-	fill_status(&status);
-	if (params[1].memref.size >= sizeof(status)) {
-		memcpy(params[1].memref.buffer, &status, sizeof(status));
-		params[1].memref.size = sizeof(status);
-	}
-	mutex_unlock(&lock);
 	return res;
 }
 
-/* Repeat diagnostic: CLOSE's NPU interrupt writes without hardware handoff. */
-static TEE_Result cycle_irq(void *session, uint32_t types, bool paging,
-			    uint32_t zap_mask, bool command_line)
+
+/* Caller holds the core lock and has validated the entire same-A group.
+ * Independent semantic tiles share A, but each core has its own B/C binding.
+ * C is tile-major, preserving the generic caller's existing result layout. */
+static TEE_Result select_gemm_wave(uint32_t first, uint32_t count, uint32_t m,
+                                  const TEE_Param *input, bool stage_input)
 {
-	const uint32_t expected = TEE_PARAM_TYPES(
-		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
-		TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	TEE_Result res = TEE_SUCCESS;
-	size_t n = 0;
+    size_t offset = 0;
 
-	if (types != expected)
-		return TEE_ERROR_BAD_PARAMETERS;
-	mutex_lock(&lock);
-	if (dev.state == PTA_TNB_STATE_LOCKED) {
-		res = TEE_ERROR_SECURITY;
-		goto out;
-	}
-	if (dev.owner != session || dev.state != PTA_TNB_STATE_ACTIVE) {
-		res = TEE_ERROR_BAD_STATE;
-		goto out;
-	}
-	for (n = 0; n < dev.core_count; n++) {
-		vaddr_t npu = npu_map(n);
+    dev.generic_selected = false;
+    for (uint32_t core = 0; core < count; core++) {
+        uint32_t job = first + core;
+        const struct pta_tnb_gemm *g = &dev.generic_gemm[job];
+        struct tnb_reg *writes = config[core];
 
-		if (!npu) {
-			res = TEE_ERROR_GENERIC;
-			goto out;
-		}
-		io_write32(npu + NPU_INT_MASK, 0);
-		io_write32(npu + NPU_INT_CLEAR, NPU_INT_ALL);
-	}
-	dsb();
-	if (paging) {
-		for (n = 0; n < 4; n++) {
-			io_write32(iommu_map(n) + IOMMU_INT_MASK, 0);
-			io_write32(iommu_map(n) + IOMMU_COMMAND,
-				   IOMMU_CMD_ENABLE_STALL);
-		}
-		dsb();
-		if (!wait_iommu_status(IOMMU_STATUS_STALL, true))
-			goto mmu_error;
-		for (n = 0; n < 4; n++)
-			io_write32(iommu_map(n) + IOMMU_COMMAND,
-				   IOMMU_CMD_DISABLE_PAGING);
-		dsb();
-		if (!wait_iommu_status(IOMMU_STATUS_PAGING, false))
-			goto mmu_error;
-		if (zap_mask) {
-			for (n = 0; n < 4; n++)
-				if (zap_mask & BIT(n))
-					io_write32(iommu_map(n) + IOMMU_COMMAND,
-						   IOMMU_CMD_ZAP_CACHE);
-			dsb();
-		}
-		for (n = 0; n < 4; n++)
-			io_write32(iommu_map(n) + IOMMU_COMMAND,
-				   IOMMU_CMD_ENABLE_PAGING);
-		dsb();
-		if (!wait_iommu_status(IOMMU_STATUS_PAGING, true))
-			goto mmu_error;
-		for (n = 0; n < 4; n++) {
-			io_write32(iommu_map(n) + IOMMU_INT_MASK, IOMMU_FAULT);
-			io_write32(iommu_map(n) + IOMMU_COMMAND,
-				   IOMMU_CMD_DISABLE_STALL);
-		}
-		dsb();
-		if (!wait_iommu_status(IOMMU_STATUS_STALL, false) || mmu_fault())
-			goto mmu_error;
-	} else if (zap_mask) {
-		for (n = 0; n < 4; n++)
-			if (zap_mask & BIT(n))
-				io_write32(iommu_map(n) +
-					   (command_line ? IOMMU_ZAP_ONE_LINE :
-							   IOMMU_COMMAND),
-					   command_line ? TNB_IOVA_CMD :
-							  IOMMU_CMD_ZAP_CACHE);
-		dsb();
-		if (mmu_fault())
-			goto mmu_error;
-	}
-	for (n = 0; n < dev.core_count; n++)
-		io_write32(npu_map(n) + NPU_INT_MASK, dev.old_npu_mask[n]);
-	dsb();
-	goto out;
-mmu_error:
-	enter_locked(PTA_TNB_FAULT_IOMMU);
-	res = TEE_ERROR_SECURITY;
+        if (m == g->m)
+            memcpy(writes, dev.generic_config[job], sizeof(dev.generic_config[job]));
+        else if (!tnb_gemm_emit(m, g->k, g->n, writes))
+            return TEE_ERROR_NOT_SUPPORTED;
+        writes[TNB_GEMM_A].value = TNB_IOVA_INPUT;
+        writes[TNB_GEMM_B].value =
+            TNB_IOVA_WEIGHT_SLOT(dev.generic_b[job]) + dev.generic_offset[job];
+        writes[TNB_GEMM_C].value = TNB_IOVA_OUTPUT + offset;
+        dev.interrupt_mask[core] = 0x300;
+        offset += (size_t)m * g->n * sizeof(int32_t);
+    }
+    dev.core_count = count;
+    dev.input_size = input->memref.size;
+    dev.output_size = offset;
+    record_generic_work();
+    if (stage_input) {
+        memcpy(input_pages, input->memref.buffer, dev.input_size);
+        dcache_clean_range(input_pages, dev.input_size);
+    }
+    memset(output_pages, 0, output_work_size());
+    dcache_clean_range(output_pages, output_work_size());
+    dev.generic_selected = true;
+    dsb();
+    return TEE_SUCCESS;
+}
+
+/* One invocation, waves of up to three independent generic tiles. All
+ * completion bits in a wave are required before copying its output. */
+static TEE_Result exec_gemm_group(void *session, uint32_t types,
+                                 TEE_Param params[TEE_NUM_PARAMS])
+{
+    struct pta_tnb_group_result *result = params[3].memref.buffer;
+    uint32_t first = params[0].value.a;
+    uint32_t count = params[0].value.b >> 16;
+    uint32_t m = params[0].value.b & 0xffff;
+    size_t total = 0, offset = 0;
+    TEE_Result res = TEE_SUCCESS;
+    TEE_Param output = { };
+
+    if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INPUT,
+            TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_OUTPUT,
+            TEE_PARAM_TYPE_MEMREF_OUTPUT) || !count || !m ||
+        !result || params[3].memref.size != sizeof(*result) ||
+        !buffer_in_area(result, sizeof(*result), CORE_MEM_SEC))
+        return TEE_ERROR_BAD_PARAMETERS;
+    memset(result, 0, sizeof(*result));
+    mutex_lock(&lock);
+    if (dev.state == PTA_TNB_STATE_LOCKED) {
+        res = TEE_ERROR_SECURITY;
+        goto out;
+    }
+    if (dev.owner != session || dev.state != PTA_TNB_STATE_ACTIVE ||
+        dev.template_id != PTA_TNB_TEMPLATE_GENERIC ||
+        first >= dev.generic_count || count > dev.generic_count - first) {
+        res = TEE_ERROR_BAD_STATE;
+        goto out;
+    }
+    /* Complete prevalidation; no device mutation for a malformed group. */
+    for (uint32_t i = first; i < first + count; i++) {
+        const struct pta_tnb_gemm *g = &dev.generic_gemm[i];
+        size_t bytes = (size_t)m * g->n * sizeof(int32_t);
+        if (m > g->m || params[1].memref.size != (size_t)m * g->k ||
+            bytes > params[2].memref.size - total) {
+            res = TEE_ERROR_BAD_PARAMETERS;
+            goto out;
+        }
+        total += bytes;
+    }
+    if (total != params[2].memref.size ||
+        !buffer_in_area(params[1].memref.buffer, params[1].memref.size, CORE_MEM_SEC) ||
+        !buffer_in_area(params[2].memref.buffer, total, CORE_MEM_SEC)) {
+        res = TEE_ERROR_BAD_PARAMETERS;
+        goto out;
+    }
+    batch_profile.group_calls++;
+    for (uint32_t i = first; i < first + count; ) {
+        uint32_t width = MIN((uint32_t)PTA_TNB_MAX_CORES, first + count - i);
+        size_t bytes = 0;
+
+        for (uint32_t n = 0; n < width; n++)
+            bytes += (size_t)m * dev.generic_gemm[i + n].n * sizeof(int32_t);
+        result->attempted += width;
+        result->phase = PTA_TNB_GROUP_SELECT;
+        res = select_gemm_wave(i, width, m, &params[1], i == first);
+        if (res)
+            goto out;
+        output.memref.buffer = (uint8_t *)params[2].memref.buffer + offset;
+        output.memref.size = bytes;
+        result->phase = PTA_TNB_GROUP_RUN;
+        batch_profile.group_jobs += width;
+        res = run_locked(session, &output);
+        if (res)
+            goto out;
+        offset += bytes;
+        result->completed += width;
+        i += width;
+    }
 out:
-	mutex_unlock(&lock);
-	return res;
+    mutex_unlock(&lock);
+    return res;
 }
 
-static TEE_Result close_device(void *session, uint32_t types, bool keep_command,
-			       bool keep_work, bool keep_irq, bool keep_secure)
+
+/* Caller holds lock; explicit END and session teardown share restoration. */
+static TEE_Result close_locked(void *session)
 {
-	const uint32_t expected =
-		TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
-				TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
 	struct tnb_hw_snapshot after = { };
-	struct tnb_hw_snapshot baseline = { };
 	vaddr_t bussgrf = io_map(BUSSGRF_BASE, BUSSGRF_SIZE);
 	vaddr_t firewall = io_map(FIREWALL_DDR_BASE, FIREWALL_DDR_SIZE);
 	TEE_Result res = TEE_SUCCESS;
-	uint64_t profile_start = profile_now();
+	uint64_t profile_start = profile_now(), tick;
 	bool restored = true;
 	size_t n = 0;
 
-	if (types != expected || !bussgrf || !firewall)
+	if (!bussgrf || !firewall)
 		return TEE_ERROR_BAD_PARAMETERS;
-	mutex_lock(&lock);
 	if (dev.state == PTA_TNB_STATE_LOCKED) {
 		res = TEE_ERROR_SECURITY;
 		goto out;
@@ -2018,23 +1721,7 @@ static TEE_Result close_device(void *session, uint32_t types, bool keep_command,
 		goto out;
 	}
 	if (dev.state == PTA_TNB_STATE_PREPARED) {
-		if (dev.secure_held &&
-		    !restore_iommu(dev.mmu, bussgrf, firewall, false))
-			goto lock;
-		if (dev.irq_held) {
-			for (n = 0; n < dev.core_count; n++)
-				if (!restore_irq(n, dev.irq_enabled[n]))
-					goto lock;
-		}
-		if (!keep_command && (dev.prepare_flags & TNB_FLAG_UNCACHED_COMMAND) &&
-		    !set_command_page_uncached(false)) {
-			dev.state = PTA_TNB_STATE_LOCKED;
-			dev.owner = NULL;
-			dev.fault = PTA_TNB_FAULT_RESTORE;
-			res = TEE_ERROR_SECURITY;
-			goto out;
-		}
-		clear_work(keep_command);
+		clear_work();
 		memset(&dev, 0, sizeof(dev));
 		goto out;
 	}
@@ -2042,16 +1729,7 @@ static TEE_Result close_device(void *session, uint32_t types, bool keep_command,
 		res = TEE_ERROR_BAD_STATE;
 		goto out;
 	}
-	baseline = dev.before;
-	if (keep_secure) {
-		if (snapshot(&baseline))
-			goto lock;
-		memcpy(baseline.iommu_dte, dev.before.iommu_dte,
-		       sizeof(baseline.iommu_dte));
-		memcpy(baseline.iommu_status, dev.before.iommu_status,
-		       sizeof(baseline.iommu_status));
-	}
-	for (n = 0; n < dev.core_count; n++) {
+	for (n = 0; n < PTA_TNB_MAX_CORES; n++) {
 		vaddr_t npu = npu_map(n);
 
 		if (!npu)
@@ -2060,15 +1738,15 @@ static TEE_Result close_device(void *session, uint32_t types, bool keep_command,
 		io_write32(npu + NPU_INT_CLEAR, NPU_INT_ALL);
 	}
 	dsb();
-	if (!restore_iommu(dev.mmu, bussgrf, firewall, keep_secure))
+	tick = profile_now();
+	if (!restore_iommu(dev.mmu))
 		goto lock;
-	if (!keep_work && !keep_command &&
-	    (dev.prepare_flags & TNB_FLAG_UNCACHED_COMMAND) &&
-	    !set_command_page_uncached(false))
-		goto lock;
-	if (!keep_work)
-		clear_work(keep_command);
-	for (n = 0; n < dev.core_count; n++) {
+	batch_profile.close_mmu_ticks += profile_now() - tick;
+	tick = profile_now();
+	clear_work();
+	batch_profile.close_clear_ticks += profile_now() - tick;
+	tick = profile_now();
+	for (n = 0; n < PTA_TNB_MAX_CORES; n++) {
 		vaddr_t npu = npu_map(n);
 
 		if (!npu) {
@@ -2077,21 +1755,15 @@ static TEE_Result close_device(void *session, uint32_t types, bool keep_command,
 		}
 		io_write32(npu + NPU_INT_MASK, dev.old_npu_mask[n]);
 	}
-	if (!restored)
+	if (!restored || !restore_secure(bussgrf, firewall, &dev.before))
 		goto lock;
-	if (!keep_irq)
-		for (n = 0; n < dev.core_count; n++)
-			restored = restore_irq(n, dev.irq_enabled[n]) && restored;
+	for (n = 0; n < PTA_TNB_MAX_CORES; n++)
+		restored = restore_irq(n, dev.irq_enabled[n]) && restored;
 	if (!restored || snapshot(&after) ||
-	    !snapshot_equal(&baseline, &after))
+	    !snapshot_equal(&dev.before, &after))
 		goto lock;
-	if (keep_work) {
-		dev.irq_held = keep_irq;
-		dev.secure_held = keep_secure;
-		dev.state = PTA_TNB_STATE_PREPARED;
-		dev.stage = PTA_TNB_STAGE_PREPARED;
-		goto out;
-	}
+	batch_profile.close_restore_ticks += profile_now() - tick;
+	dev.security_touched = false;
 	memset(&dev, 0, sizeof(dev));
 	dev.stage = PTA_TNB_STAGE_RESTORED;
 	goto out;
@@ -2100,10 +1772,35 @@ lock:
 	res = TEE_ERROR_SECURITY;
 out:
 	profile_add(&profile.close_calls, &profile.close_ticks, profile_start);
-	mutex_unlock(&lock);
 	return res;
 }
 
+static TEE_Result close_device(void *session, uint32_t types)
+{
+    TEE_Result res;
+    if (types != TEE_PARAM_TYPES(0,0,0,0))
+        return TEE_ERROR_BAD_PARAMETERS;
+    mutex_lock(&lock);
+    res = close_locked(session);
+    mutex_unlock(&lock);
+    return res;
+}
+
+static TEE_Result get_batch_profile(uint32_t types,
+	TEE_Param params[TEE_NUM_PARAMS])
+{
+	if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT, 0, 0, 0))
+		return TEE_ERROR_BAD_PARAMETERS;
+	if (params[0].memref.size < sizeof(batch_profile)) {
+		params[0].memref.size = sizeof(batch_profile);
+		return TEE_ERROR_SHORT_BUFFER;
+	}
+	mutex_lock(&lock);
+	memcpy(params[0].memref.buffer, &batch_profile, sizeof(batch_profile));
+	params[0].memref.size = sizeof(batch_profile);
+	mutex_unlock(&lock);
+	return TEE_SUCCESS;
+}
 
 static TEE_Result get_status(uint32_t types,
 			     TEE_Param params[TEE_NUM_PARAMS])
@@ -2128,187 +1825,6 @@ static TEE_Result get_status(uint32_t types,
 	return TEE_SUCCESS;
 }
 
-static bool work_difference(struct pta_tnb_hw_state *state, uint32_t area,
-			    uint32_t index, uint32_t expected, uint32_t actual)
-{
-	if (expected == actual)
-		return false;
-	state->memory_area = area;
-	state->memory_index = index;
-	state->memory_expected = expected;
-	state->memory_actual = actual;
-	return true;
-}
-
-/* Diagnostic only: observe work memory without cleaning or invalidating it. */
-static TEE_Result check_work(const struct pta_tnb_gemm *desc, void *b,
-			     size_t b_size, struct pta_tnb_hw_state *state)
-{
-	struct ts_session *caller = ts_get_calling_session();
-	struct mobj *mobj = NULL;
-	uint64_t words[TNB_GEMM_WORDS] = { };
-	size_t offset = 0;
-	size_t a_span = dev.a_span;
-	size_t b_span = ROUNDUP(dev.b_size, TNB_PAGE_SIZE);
-	size_t c_span = dev.c_span;
-	size_t table = 0;
-	size_t index = 0;
-
-	if (!caller || !is_user_ta_ctx(caller->ctx) ||
-	    desc->abi_version != PTA_TNB_ABI_VERSION || desc->mode != dev.mode ||
-	    !tnb_gemm_emit(desc->m, desc->k, desc->n, words) ||
-	    (uint64_t)desc->m * desc->k != dev.a_size ||
-	    (uint64_t)desc->k * desc->n != dev.b_size ||
-	    (uint64_t)desc->m * desc->n * sizeof(int32_t) != dev.c_size ||
-	    b_size != dev.b_size ||
-	    vm_buf_to_mboj_offs(to_user_mode_ctx(caller->ctx), b, b_span,
-			       &mobj, &offset) || !mobj || !mobj_is_nonsec(mobj))
-		return TEE_ERROR_BAD_PARAMETERS;
-	words[TNB_GEMM_A] = TNB_COMMAND_WITH_VALUE(words[TNB_GEMM_A], TNB_IOVA_A);
-	words[TNB_GEMM_B] = TNB_COMMAND_WITH_VALUE(words[TNB_GEMM_B], TNB_IOVA_B);
-	words[TNB_GEMM_C] = TNB_COMMAND_WITH_VALUE(words[TNB_GEMM_C], TNB_IOVA_C);
-	for (index = 0; index < TNB_PAGE_SIZE / sizeof(uint32_t); index++) {
-		uint32_t expected = index < TNB_GEMM_WORDS * 2 ?
-			(uint32_t)(words[index / 2] >> ((index % 2) * 32)) : 0;
-		uint32_t actual = io_read32((vaddr_t)command_buffer(0) +
-					   index * sizeof(uint32_t));
-
-		if (work_difference(state, PTA_TNB_WORK_COMMAND, index,
-				    expected, actual))
-			return TEE_SUCCESS;
-	}
-	for (index = 0; index < ARRAY_SIZE(directory_table); index++) {
-		uint32_t iova = index << TNB_IOVA_DTE_SHIFT;
-		uint32_t expected = 0;
-
-		if (iova == TNB_IOVA_CMD || iova == TNB_IOVA_A ||
-		    iova == TNB_IOVA_C ||
-		    (iova >= TNB_IOVA_B && iova < TNB_IOVA_B +
-		     ROUNDUP(b_span, SIZE_M(4))))
-			expected = make_desc_v2(virt_to_phys(page_table_for_iova(iova)));
-		if (work_difference(state, PTA_TNB_WORK_DIRECTORY, index,
-				    expected, directory_table[index]))
-			return TEE_SUCCESS;
-	}
-	for (table = 0; table < TNB_PAGE_TABLE_COUNT; table++) {
-		for (index = 0; index < ARRAY_SIZE(page_tables[table]); index++) {
-			size_t byte = index * TNB_PAGE_SIZE;
-			paddr_t pa = 0;
-			uint32_t flags = TNB_PTE_READ;
-			uint32_t expected = 0;
-			uint32_t actual = page_tables[table][index];
-
-			if (table == 0 && index == 0) {
-				pa = virt_to_phys(command_buffer(0));
-				flags |= TNB_PTE_SECURE;
-			} else if (table == 1 && byte < a_span) {
-				pa = virt_to_phys((uint8_t *)a_pages + byte);
-				flags |= TNB_PTE_SECURE;
-				state->a_pte[index] = actual;
-			} else if (table >= 2 && table <= 4) {
-				byte += (table - 2) * SIZE_M(4);
-				if (byte < b_span &&
-				    mobj_get_pa(mobj, offset + byte, TNB_PAGE_SIZE, &pa))
-					return TEE_ERROR_GENERIC;
-			} else if (table == 5 && byte < c_span) {
-				pa = virt_to_phys((uint8_t *)c_pages + byte);
-				flags |= TNB_PTE_WRITE | TNB_PTE_SECURE;
-				state->c_pte[index] = actual;
-			}
-			if (pa)
-				expected = make_desc_v2(pa) | flags;
-			if (work_difference(state, PTA_TNB_WORK_PTE,
-					    table * ARRAY_SIZE(page_tables[table]) + index,
-					    expected, actual))
-				return TEE_SUCCESS;
-		}
-	}
-	return TEE_SUCCESS;
-}
-
-static TEE_Result read_hw(uint32_t types, TEE_Param params[TEE_NUM_PARAMS])
-{
-	const uint32_t expected =
-		TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT,
-				TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_INPUT,
-				TEE_PARAM_TYPE_NONE);
-	struct pta_tnb_hw_state state = { };
-	TEE_Result res = TEE_SUCCESS;
-	vaddr_t npu = npu_map(0);
-	size_t n = 0;
-
-	if (types != expected || !npu ||
-	    params[1].memref.size != sizeof(struct pta_tnb_gemm) ||
-	    !params[1].memref.buffer || !params[2].memref.buffer)
-		return TEE_ERROR_BAD_PARAMETERS;
-	if (params[0].memref.size < sizeof(state)) {
-		params[0].memref.size = sizeof(state);
-		return TEE_ERROR_SHORT_BUFFER;
-	}
-	mutex_lock(&lock);
-	if (dev.state == PTA_TNB_STATE_ACTIVE) {
-		res = check_work(params[1].memref.buffer,
-				 params[2].memref.buffer, params[2].memref.size, &state);
-		if (res) {
-			mutex_unlock(&lock);
-			return res;
-		}
-	}
-	state.npu[0] = io_read32(npu + NPU_INT_STATUS);
-	state.npu[1] = io_read32(npu + NPU_INT_RAW_STATUS);
-	state.npu[2] = io_read32(npu + NPU_PC_TASK_STATUS);
-	state.npu[3] = io_read32(npu + NPU_PC_DATA_ADDR);
-	state.npu[4] = io_read32(npu + NPU_PC_DATA_AMOUNT);
-	state.npu[5] = io_read32(npu + NPU_PC_TASK_CONTROL);
-	state.npu[6] = io_read32(npu + NPU_PC_DMA_BASE_ADDR);
-	state.npu[7] = io_read32(npu + NPU_PC_OP_EN);
-	state.npu[8] = io_read32(npu + NPU_CNA_POINTER);
-	state.npu[9] = io_read32(npu + NPU_CORE_POINTER);
-	for (n = 0; n < PTA_TNB_HW_IOMMUS; n++) {
-		vaddr_t iommu = iommu_map(n);
-
-		if (!iommu) {
-			mutex_unlock(&lock);
-			return TEE_ERROR_GENERIC;
-		}
-		state.iommu[n][0] = io_read32(iommu + IOMMU_DTE);
-		state.iommu[n][1] = io_read32(iommu + IOMMU_STATUS);
-		state.iommu[n][2] = io_read32(iommu + IOMMU_INT_RAW_STATUS);
-		state.iommu[n][3] = io_read32(iommu + IOMMU_INT_STATUS);
-		state.iommu[n][4] = io_read32(iommu + IOMMU_INT_MASK);
-		state.iommu[n][5] = io_read32(iommu + IOMMU_AUTO_GATING);
-	}
-	mutex_unlock(&lock);
-	memcpy(params[0].memref.buffer, &state, sizeof(state));
-	params[0].memref.size = sizeof(state);
-	return TEE_SUCCESS;
-}
-
-static TEE_Result lock_device(void *session, uint32_t types)
-{
-	const uint32_t expected =
-		TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE,
-				TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
-	TEE_Result res = TEE_SUCCESS;
-
-	if (types != expected)
-		return TEE_ERROR_BAD_PARAMETERS;
-	mutex_lock(&lock);
-	if (dev.state == PTA_TNB_STATE_LOCKED)
-		res = TEE_ERROR_SECURITY;
-	else if (dev.owner != session)
-		res = TEE_ERROR_ACCESS_DENIED;
-	else if (dev.state != PTA_TNB_STATE_ACTIVE &&
-		 dev.state != PTA_TNB_STATE_RUNNING)
-		res = TEE_ERROR_BAD_STATE;
-	else {
-		enter_locked(PTA_TNB_FAULT_VERIFY);
-		res = TEE_ERROR_SECURITY;
-	}
-	mutex_unlock(&lock);
-	return res;
-}
-
 static TEE_Result open_session(uint32_t types, TEE_Param params[TEE_NUM_PARAMS],
 			       void **session)
 {
@@ -2331,8 +1847,11 @@ static TEE_Result open_session(uint32_t types, TEE_Param params[TEE_NUM_PARAMS],
 	memset(&profile, 0, sizeof(profile));
 	profile.version = PTA_TNB_PROFILE_VERSION;
 	profile.counter_frequency = read_cntfrq();
+	memset(&batch_profile, 0, sizeof(batch_profile));
+	batch_profile.version = PTA_TNB_BATCH_PROFILE_VERSION;
+	batch_profile.counter_frequency = profile.counter_frequency;
 	mutex_unlock(&lock);
-	*session = calloc(1, 1);
+	*session = calloc(1, sizeof(struct tnb_session));
 	if (!*session)
 		return TEE_ERROR_OUT_OF_MEMORY;
 	return TEE_SUCCESS;
@@ -2340,109 +1859,50 @@ static TEE_Result open_session(uint32_t types, TEE_Param params[TEE_NUM_PARAMS],
 
 static void close_session(void *session)
 {
-	bool irq_restored = true;
-	size_t n = 0;
+	struct tnb_session *tnb_session = session;
 
 	mutex_lock(&lock);
-#ifdef CFG_TNB_SECURITY_TEST
-	if (secure_ram_test_owner == session)
-		secure_ram_test_clear();
-#endif
-	if (dev.owner == session && dev.state == PTA_TNB_STATE_PREPARED) {
-		if (dev.secure_held) {
-			vaddr_t bussgrf = io_map(BUSSGRF_BASE, BUSSGRF_SIZE);
-			vaddr_t firewall = io_map(FIREWALL_DDR_BASE, FIREWALL_DDR_SIZE);
-
-			if (!bussgrf || !firewall ||
-			    !restore_iommu(dev.mmu, bussgrf, firewall, false)) {
+	if (dev.owner == session) {
+		if (dev.state == PTA_TNB_STATE_PREPARED ||
+		    dev.state == PTA_TNB_STATE_ACTIVE) {
+			if (close_locked(session) && dev.state != PTA_TNB_STATE_LOCKED)
 				enter_locked(PTA_TNB_FAULT_RESTORE);
-				goto out;
-			}
+		} else if (dev.state == PTA_TNB_STATE_RUNNING) {
+			enter_locked(PTA_TNB_FAULT_CALLER);
 		}
-		if (dev.irq_held)
-			for (n = 0; n < dev.core_count; n++)
-				irq_restored = restore_irq(n, dev.irq_enabled[n]) &&
-					       irq_restored;
-		if (!irq_restored ||
-		    ((dev.prepare_flags & TNB_FLAG_UNCACHED_COMMAND) &&
-		     !set_command_page_uncached(false))) {
-			dev.state = PTA_TNB_STATE_LOCKED;
-			dev.owner = NULL;
-			dev.fault = PTA_TNB_FAULT_RESTORE;
-		} else {
-			clear_work(false);
-			memset(&dev, 0, sizeof(dev));
-		}
-	} else if (dev.owner == session &&
-		   (dev.state == PTA_TNB_STATE_ACTIVE ||
-		    dev.state == PTA_TNB_STATE_RUNNING)) {
-		enter_locked(PTA_TNB_FAULT_CALLER);
 	}
-out:
+	/* A LOCKED device may retain PTE access; quarantine registrations. */
+	if (dev.state != PTA_TNB_STATE_LOCKED)
+		release_registered_weights(tnb_session);
 	mutex_unlock(&lock);
+	free(tnb_session->plans);
+	memset(tnb_session, 0, sizeof(*tnb_session));
 	free(session);
 }
 
 static TEE_Result invoke_command(void *session, uint32_t command,
-				 uint32_t types,
-				 TEE_Param params[TEE_NUM_PARAMS])
+                                uint32_t types, TEE_Param params[TEE_NUM_PARAMS])
 {
-	switch (command) {
-	case PTA_TNB_CMD_GET_CAPS:
-		return get_caps(types, params);
-	case PTA_TNB_CMD_GEMM:
-		return prepare_gemm(session, types, params, false, false);
-	case PTA_TNB_CMD_GEMM_REUSE:
-		return prepare_gemm(session, types, params, true, false);
-	case PTA_TNB_CMD_PREPARE_BATCH:
-		return prepare_gemm(session, types, params, false, true);
-	case PTA_TNB_CMD_UPDATE:
-		return update_gemm(session, types, params);
-	case PTA_TNB_CMD_ACTIVATE:
-		return activate(session, types);
-	case PTA_TNB_CMD_RUN:
-		return run(session, types, params);
-	case PTA_TNB_CMD_CLOSE:
-		return close_device(session, types, false, false, false, false);
-	case PTA_TNB_CMD_CLOSE_KEEP:
-		return close_device(session, types, true, false, false, false);
-	case PTA_TNB_CMD_SUSPEND:
-		return close_device(session, types, false, true, false, false);
-	case PTA_TNB_CMD_SUSPEND_MASKED:
-		return close_device(session, types, false, true, true, false);
-	case PTA_TNB_CMD_SUSPEND_SECURE:
-		return close_device(session, types, false, true, true, true);
-	case PTA_TNB_CMD_CYCLE_IRQ:
-		return cycle_irq(session, types, false, 0, false);
-	case PTA_TNB_CMD_CYCLE_PAGING:
-		return cycle_irq(session, types, true, 0, false);
-	case PTA_TNB_CMD_CYCLE_ZAP:
-		return cycle_irq(session, types, true, 0xf, false);
-	case PTA_TNB_CMD_CYCLE_ZAP_ON:
-		return cycle_irq(session, types, false, 0xf, false);
-	case PTA_TNB_CMD_CYCLE_ZAP0:
-		return cycle_irq(session, types, false, BIT(0), false);
-	case PTA_TNB_CMD_CYCLE_ZAP1:
-		return cycle_irq(session, types, false, BIT(1), false);
-	case PTA_TNB_CMD_CYCLE_ZAP_CMD:
-		return cycle_irq(session, types, false, BIT(1), true);
-	case PTA_TNB_CMD_GET_STATUS:
-		return get_status(types, params);
-	case PTA_TNB_CMD_READ_HW:
-		return read_hw(types, params);
-	case PTA_TNB_CMD_LOCK:
-		return lock_device(session, types);
-#ifdef CFG_TNB_SECURITY_TEST
-	case PTA_TNB_CMD_SECURE_RAM_TEST_BEGIN:
-		return secure_ram_test_begin(session, types, params);
-	case PTA_TNB_CMD_SECURE_RAM_TEST_CHECK:
-		return secure_ram_test_check(session, types, params);
-	case PTA_TNB_CMD_SECURE_RAM_TEST_END:
-		return secure_ram_test_end(session, types);
-#endif
-	default:
-		return TEE_ERROR_NOT_SUPPORTED;
-	}
+    switch (command) {
+    case PTA_TNB_CMD_REGISTER_WEIGHT:
+        return register_weight(session, types, params);
+    case PTA_TNB_CMD_PREPARE_REGISTERED_BATCH:
+        return prepare_registered_batch(session, types, params);
+    case PTA_TNB_CMD_EXEC_GEMM_GROUP:
+        return exec_gemm_group(session, types, params);
+    case PTA_TNB_CMD_ACTIVATE:
+        return activate(session, types);
+    case PTA_TNB_CMD_CLOSE:
+        return close_device(session, types);
+    case PTA_TNB_CMD_GET_CAPS:
+        return get_caps(types, params);
+    case PTA_TNB_CMD_GET_STATUS:
+        return get_status(types, params);
+    case PTA_TNB_CMD_GET_BATCH_PROFILE:
+        return get_batch_profile(types, params);
+    default:
+        return TEE_ERROR_NOT_SUPPORTED;
+    }
 }
 
 pseudo_ta_register(.uuid = PTA_TNB_UUID, .name = "tnb",

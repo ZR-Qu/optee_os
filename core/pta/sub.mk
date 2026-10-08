@@ -3,8 +3,7 @@ subdirs-$(CFG_TEE_CORE_EMBED_INTERNAL_TESTS) += tests
 srcs-$(CFG_ATTESTATION_PTA) += attestation.c
 srcs-$(CFG_DEVICE_ENUM_PTA) += device.c
 srcs-$(CFG_TA_GPROF_SUPPORT) += gprof.c
-srcs-$(CFG_TNB) += tnb.c
-srcs-$(CFG_TNB) += tnb_gemm.c
+srcs-$(CFG_TNB) += tnb.c tnb_npu.c tnb_iommu.c tnb_gemm.c
 ifeq ($(CFG_TNB_SECURITY_TEST),y)
 cflags-tnb.c-y += -DCFG_TNB_SECURITY_TEST=1
 endif
