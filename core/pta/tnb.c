@@ -12,6 +12,7 @@
 #include <mm/core_memprot.h>
 #include <mm/mobj.h>
 #include <mm/page_alloc.h>
+#include <mm/phys_mem.h>
 #include <mm/vm.h>
 #include <platform_config.h>
 #include <pta_tnb.h>
@@ -64,14 +65,10 @@
 #define TNB_PAGE_SIZE 4096
 #define TNB_DT_ENTRIES 1024
 #define TNB_PT_ENTRIES 1024
-/* Match the IOVA window used by the Linux RKNPU allocator. */
+/* Fixed A/C windows; registered B windows follow C without overlapping it. */
 #define TNB_IOVA_INPUT 0x11000000
-#define TNB_IOVA_WEIGHT 0x12000000
-#define TNB_IOVA_WEIGHT_SLOT(slot) \
-	((slot) == PTA_TNB_FFN_WEIGHT_SLOT_GATE ? 0x12000000 : \
-	 (slot) == PTA_TNB_FFN_WEIGHT_SLOT_UP ? 0x14000000 : 0x15000000)
+#define TNB_IOVA_WEIGHT 0x14000000
 #define TNB_IOVA_OUTPUT 0x13000000
-#define TNB_IOVA_GEMM_B1 0x14000000
 #define TNB_IOVA_DTE_SHIFT 22
 #define TNB_IOVA_PTE_SHIFT 12
 #define TNB_PTE_VALID BIT(0)
@@ -83,8 +80,6 @@
 #define TNB_DESC_HI2_MASK GENMASK_64(39, 36)
 #define TNB_TIMEOUT_US 100000
 #define TNB_PAGE_TABLE_COUNT 2
-#define TNB_FFN_WEIGHT_CACHE_COUNT 84
-#define TNB_FFN_WEIGHT_PTE_TABLE_COUNT 3
 #define TNB_INPUT_STORAGE_SIZE 57344
 #define TNB_OUTPUT_STORAGE_SIZE PTA_TNB_MAX_BATCH_OUTPUT_SIZE
 
@@ -102,19 +97,16 @@ struct tnb_hw_snapshot {
 	uint32_t iommu_status[4];
 };
 
-/* Secure PTE storage has a fixed budget, independent of the core heap.
- * Each page maps 4 MiB. No separate array of backing PAs is retained. */
-#define TNB_REGISTERED_PT_PAGES 256
-static uint32_t registered_pt[TNB_REGISTERED_PT_PAGES][TNB_PT_ENTRIES]
-    __aligned(TNB_PAGE_SIZE);
-static bool registered_pt_used[TNB_REGISTERED_PT_PAGES];
+/* PTEs live in session-owned secure physical memory, outside the core heap.
+ * Each table page maps 4 MiB. No separate array of backing PAs is retained. */
 static uint32_t next_weight_handle;
 struct tnb_registered_weight {
     struct tnb_registered_weight *next;
     struct mobj *mobj;
     size_t offset, size;
-    uint32_t handle, first, count;
-    paddr_t table_pa[3];
+    uint32_t handle, count;
+    tee_mm_entry_t *mm;
+    uint32_t *pt;
 };
 #define TNB_GENERIC_PLAN_CACHE_COUNT 4u
 struct tnb_generic_plan {
@@ -134,6 +126,7 @@ struct tnb_dev {
 	uint32_t generic_count;
 	bool generic_selected;
 	uint32_t generic_b[PTA_TNB_GEMM_MAX_JOBS];
+	uint32_t generic_b_iova[3];
 	uint32_t generic_offset[PTA_TNB_GEMM_MAX_JOBS];
 	struct pta_tnb_gemm generic_gemm[PTA_TNB_GEMM_MAX_JOBS];
 	struct tnb_reg generic_config[PTA_TNB_GEMM_MAX_JOBS][TNB_GEMM_WRITES];
@@ -1087,10 +1080,10 @@ static void release_registered_weights(struct tnb_session *ctx)
     while (ctx->weights) {
         struct tnb_registered_weight *weight = ctx->weights;
         ctx->weights = weight->next;
-        for (size_t n = 0; n < weight->count; n++) {
-            memset(registered_pt[weight->first + n], 0, TNB_PAGE_SIZE);
-            registered_pt_used[weight->first + n] = false;
-        }
+        memset(weight->pt, 0, weight->count * TNB_PAGE_SIZE);
+        dcache_clean_range(weight->pt, weight->count * TNB_PAGE_SIZE);
+        dsb();
+        tee_mm_free(weight->mm);
         mobj_put(weight->mobj);
         free(weight);
     }
@@ -1104,13 +1097,13 @@ static TEE_Result register_weight(void *session, uint32_t types,
     struct tnb_session *ctx = session;
     struct tnb_registered_weight *weight = NULL;
     struct mobj *mobj = NULL;
-    size_t offs = 0, size = params[0].memref.size, n, first, count;
+    size_t offs = 0, size = params[0].memref.size, n, count;
     TEE_Result res = TEE_ERROR_BAD_PARAMETERS;
     uint64_t start = profile_now();
 
     if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
                                 TEE_PARAM_TYPE_VALUE_OUTPUT, 0, 0) ||
-        !size || size > SIZE_M(12) || (size & (TNB_PAGE_SIZE - 1)) ||
+        !size || size > UINT32_MAX || (size & (TNB_PAGE_SIZE - 1)) ||
         !caller_buffer_mobj(params[0].memref.buffer, size, &mobj, &offs))
         return res;
     mutex_lock(&lock);
@@ -1126,46 +1119,41 @@ static TEE_Result register_weight(void *session, uint32_t types,
             goto out;
         }
     count = ROUNDUP(size, SIZE_M(4)) / SIZE_M(4);
-    for (first = 0; first + count <= TNB_REGISTERED_PT_PAGES; first++) {
-        for (n = 0; n < count && !registered_pt_used[first + n]; n++)
-            ;
-        if (n == count)
-            break;
-    }
     res = TEE_ERROR_OUT_OF_MEMORY;
-    if (first + count > TNB_REGISTERED_PT_PAGES || next_weight_handle == UINT32_MAX)
+    if (next_weight_handle == UINT32_MAX)
         goto out;
     weight = calloc(1, sizeof(*weight));
     if (!weight)
         goto out;
-    for (n = 0; n < count; n++) {
-        if (!secure_page(registered_pt[first + n]))
-            goto invalid;
-        weight->table_pa[n] = virt_to_phys(registered_pt[first + n]);
-        memset(registered_pt[first + n], 0, TNB_PAGE_SIZE);
-    }
+    weight->mm = phys_mem_ta_alloc(count * TNB_PAGE_SIZE);
+    if (!weight->mm)
+        goto invalid;
+    weight->pt = phys_to_virt(tee_mm_get_smem(weight->mm),
+                             MEM_AREA_SEC_RAM_OVERALL, count * TNB_PAGE_SIZE);
+    if (!weight->pt)
+        goto invalid;
+    res = TEE_ERROR_BAD_PARAMETERS;
+    if (!secure_page(weight->pt))
+        goto invalid;
+    memset(weight->pt, 0, count * TNB_PAGE_SIZE);
     for (n = 0; n < size / TNB_PAGE_SIZE; n++) {
         paddr_t pa = 0;
         if (mobj_get_pa(mobj, offs + n * TNB_PAGE_SIZE, TNB_PAGE_SIZE, &pa) ||
             !pa || (pa & (TNB_PAGE_SIZE - 1)) || pa >= BIT64(40) ||
             !core_pbuf_is(CORE_MEM_NON_SEC, pa, TNB_PAGE_SIZE))
             goto invalid;
-        registered_pt[first + n / TNB_PT_ENTRIES][n % TNB_PT_ENTRIES] =
-            make_desc_v2(pa) | TNB_PTE_READ;
+        weight->pt[n] = make_desc_v2(pa) | TNB_PTE_READ;
     }
     weight->mobj = mobj_get(mobj);
     if (!weight->mobj)
         goto invalid;
     weight->offset = offs;
     weight->size = size;
-    weight->first = first;
     weight->count = count;
     weight->handle = ++next_weight_handle;
     dcache_clean_range(params[0].memref.buffer, size);
-    dcache_clean_range(registered_pt[first], count * TNB_PAGE_SIZE);
+    dcache_clean_range(weight->pt, count * TNB_PAGE_SIZE);
     dsb();
-    for (n = 0; n < count; n++)
-        registered_pt_used[first + n] = true;
     weight->next = ctx->weights;
     ctx->weights = weight;
     params[1].value.a = weight->handle;
@@ -1176,8 +1164,8 @@ static TEE_Result register_weight(void *session, uint32_t types,
     res = TEE_SUCCESS;
     goto out;
 invalid:
+    tee_mm_free(weight->mm);
     free(weight);
-    res = TEE_ERROR_BAD_PARAMETERS;
 out:
     mutex_unlock(&lock);
     return res;
@@ -1230,6 +1218,8 @@ static TEE_Result prepare_registered_batch(void *session, uint32_t types,
     struct tnb_generic_plan *plan = NULL;
     TEE_Result res = TEE_ERROR_BAD_PARAMETERS;
     size_t i, n;
+    uint64_t next_iova = TNB_IOVA_WEIGHT;
+    uint32_t b_iova[3];
     uint64_t start = profile_now(), tick;
 
     if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
@@ -1253,6 +1243,10 @@ static TEE_Result prepare_registered_batch(void *session, uint32_t types,
                 break;
         if (!weights[i])
             goto out;
+        b_iova[i] = next_iova;
+        next_iova += (uint64_t)weights[i]->count * SIZE_M(4);
+        if (next_iova > BIT64(32))
+            goto out;
     }
     for (i = 0; i < batch.count; i++) {
         const struct pta_tnb_gemm_job *job = &batch.job[i];
@@ -1272,10 +1266,13 @@ static TEE_Result prepare_registered_batch(void *session, uint32_t types,
     batch_profile.setup_ticks += profile_now() - tick;
     if (res)
         goto out;
-    for (i = 0; i < 3; i++)
-        for (n = 0; n < 3; n++)
-            directory_table[dte_index(TNB_IOVA_WEIGHT_SLOT(i) + n * SIZE_M(4))] =
-                n < weights[i]->count ? make_desc_v2(weights[i]->table_pa[n]) : 0;
+    for (i = 0; i < 3; i++) {
+        paddr_t table_pa = tee_mm_get_smem(weights[i]->mm);
+        dev.generic_b_iova[i] = b_iova[i];
+        for (n = 0; n < weights[i]->count; n++)
+            directory_table[dte_index(b_iova[i]) + n] =
+                make_desc_v2(table_pa + n * TNB_PAGE_SIZE);
+    }
     for (i = 0; i < batch.count; i++) {
         dev.generic_gemm[i] = batch.job[i].gemm;
         dev.generic_b[i] = batch.job[i].b_index;
@@ -1284,7 +1281,7 @@ static TEE_Result prepare_registered_batch(void *session, uint32_t types,
                sizeof(dev.generic_config[i]));
     }
     dev.generic_count = batch.count;
-    dev.debug[PTA_TNB_DEBUG_PTE_WEIGHT] = registered_pt[weights[0]->first][0];
+    dev.debug[PTA_TNB_DEBUG_PTE_WEIGHT] = weights[0]->pt[0];
     dcache_clean_range(directory_table, sizeof(directory_table));
     dsb();
 out:
@@ -1602,7 +1599,7 @@ static TEE_Result select_gemm_wave(uint32_t first, uint32_t count, uint32_t m,
             return TEE_ERROR_NOT_SUPPORTED;
         writes[TNB_GEMM_A].value = TNB_IOVA_INPUT;
         writes[TNB_GEMM_B].value =
-            TNB_IOVA_WEIGHT_SLOT(dev.generic_b[job]) + dev.generic_offset[job];
+            dev.generic_b_iova[dev.generic_b[job]] + dev.generic_offset[job];
         writes[TNB_GEMM_C].value = TNB_IOVA_OUTPUT + offset;
         dev.interrupt_mask[core] = 0x300;
         offset += (size_t)m * g->n * sizeof(int32_t);

@@ -127,7 +127,7 @@ bool tnb_gemm_emit(uint32_t m, uint32_t k, uint32_t n,
 	uint32_t width = n - 1;
 	uint32_t stride = n / 4 - 1;
 
-	if (m < 1 || m > PTA_TNB_GEMM_M_MAX || k < 2048 || k > PTA_TNB_GEMM_K_MAX ||
+	if (m < 1 || m > PTA_TNB_GEMM_M_MAX || k < PTA_TNB_GEMM_K_MIN || k > PTA_TNB_GEMM_K_MAX ||
 	    n < PTA_TNB_GEMM_N_MIN || n > PTA_TNB_GEMM_N_MAX ||
 	    k % 32 || n % PTA_TNB_GEMM_N_ALIGN ||
 	    k * n > PTA_TNB_GEMM_B_MAX)

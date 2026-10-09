@@ -7,8 +7,8 @@
 #define PTA_TNB_UUID { 0x0ea88044, 0x846a, 0x47a2, \
 	{ 0x87, 0xff, 0xc1, 0xb7, 0x20, 0xf0, 0x69, 0x4e } }
 
-#define PTA_TNB_ABI_VERSION 42
-#define PTA_TNB_BUILD_ID 0x4e585264u
+#define PTA_TNB_ABI_VERSION 43
+#define PTA_TNB_BUILD_ID 0x4e585266u
 
 #define PTA_TNB_CMD_GET_CAPS 0
 #define PTA_TNB_CMD_PREPARE 1
@@ -39,7 +39,9 @@
  */
 #define PTA_TNB_GEMM_MODE_W8A8 1u
 #define PTA_TNB_GEMM_M_MAX 4u
+#define PTA_TNB_GEMM_K_MIN 2048u
 #define PTA_TNB_GEMM_K_MAX 6208u
+#define PTA_TNB_GEMM_B_ALIGN 4096u
 #define PTA_TNB_GEMM_B_MAX 4545536u
 #define PTA_TNB_GEMM_N_MIN 672u
 #define PTA_TNB_GEMM_N_MAX 2048u
@@ -55,7 +57,7 @@ struct pta_tnb_gemm {
 };
 
 /* Bounded compute plan; all B ranges stay mapped until CLOSE. */
-#define PTA_TNB_GEMM_MAX_JOBS 16u
+#define PTA_TNB_GEMM_MAX_JOBS 32u
 #define PTA_TNB_GEMM_MAX_BUFFERS 3u
 struct pta_tnb_gemm_job {
 	struct pta_tnb_gemm gemm;
