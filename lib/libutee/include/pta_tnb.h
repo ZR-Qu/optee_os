@@ -7,8 +7,8 @@
 #define PTA_TNB_UUID { 0x0ea88044, 0x846a, 0x47a2, \
 	{ 0x87, 0xff, 0xc1, 0xb7, 0x20, 0xf0, 0x69, 0x4e } }
 
-#define PTA_TNB_ABI_VERSION 43
-#define PTA_TNB_BUILD_ID 0x4e585266u
+#define PTA_TNB_ABI_VERSION 48
+#define PTA_TNB_BUILD_ID 0x4e58526bu
 
 #define PTA_TNB_CMD_GET_CAPS 0
 #define PTA_TNB_CMD_PREPARE 1
@@ -38,11 +38,12 @@
  * No raw command, relocation index, interrupt mask, or security flag input.
  */
 #define PTA_TNB_GEMM_MODE_W8A8 1u
-#define PTA_TNB_GEMM_M_MAX 4u
+#define PTA_TNB_GEMM_M_MAX 16u
+#define PTA_TNB_GEMM_A_MAX 65536u
 #define PTA_TNB_GEMM_K_MIN 2048u
 #define PTA_TNB_GEMM_K_MAX 6208u
 #define PTA_TNB_GEMM_B_ALIGN 4096u
-#define PTA_TNB_GEMM_B_MAX 4545536u
+#define PTA_TNB_GEMM_B_MAX (PTA_TNB_GEMM_K_MAX * PTA_TNB_GEMM_N_MAX)
 #define PTA_TNB_GEMM_N_MIN 672u
 #define PTA_TNB_GEMM_N_MAX 2048u
 #define PTA_TNB_GEMM_N_ALIGN 32u
@@ -56,8 +57,9 @@ struct pta_tnb_gemm {
 	uint32_t reserved[3];
 };
 
-/* Bounded compute plan; all B ranges stay mapped until CLOSE. */
-#define PTA_TNB_GEMM_MAX_JOBS 32u
+/* Variable compute plan; each EXEC_GROUP remains bounded to 32 jobs.
+ * All B ranges stay mapped until CLOSE. */
+#define PTA_TNB_GEMM_GROUP_MAX_JOBS 32u
 #define PTA_TNB_GEMM_MAX_BUFFERS 3u
 struct pta_tnb_gemm_job {
 	struct pta_tnb_gemm gemm;
@@ -67,7 +69,7 @@ struct pta_tnb_gemm_job {
 struct pta_tnb_gemm_batch {
 	uint32_t count;
 	uint32_t reserved;
-	struct pta_tnb_gemm_job job[PTA_TNB_GEMM_MAX_JOBS];
+	struct pta_tnb_gemm_job job[];
 };
 
 #define PTA_TNB_PREPARE_FLAG_SECURE_PTE (1u << 0)
@@ -237,11 +239,11 @@ struct pta_tnb_secure_ram_test_check {
 #define PTA_TNB_MAX_COMMANDS 128
 #define PTA_TNB_COMMAND_TRAILER_COUNT 4
 #define PTA_TNB_MAX_INPUT_SIZE 8192
-#define PTA_TNB_MAX_BATCH_INPUT_SIZE 55296
+#define PTA_TNB_MAX_BATCH_INPUT_SIZE PTA_TNB_GEMM_A_MAX
 #define PTA_TNB_MAX_SECURE_WEIGHT_SIZE 4096
 #define PTA_TNB_MAX_WEIGHT_SIZE 12582912
 #define PTA_TNB_MAX_OUTPUT_SIZE 24576
-#define PTA_TNB_MAX_BATCH_OUTPUT_SIZE 221184
+#define PTA_TNB_MAX_BATCH_OUTPUT_SIZE (PTA_TNB_MAX_CORES * PTA_TNB_GEMM_M_MAX * PTA_TNB_GEMM_N_MAX * sizeof(int32_t))
 #define PTA_TNB_FFN_WEIGHT_SLOT_COUNT 3
 #define PTA_TNB_FFN_WEIGHT_SLOT_GATE 0
 #define PTA_TNB_FFN_WEIGHT_SLOT_UP 1
@@ -451,7 +453,7 @@ struct pta_tnb_multi_slot_chain {
 #define PTA_TNB_CMD_PREPARE_REGISTERED_BATCH 25
 #define PTA_TNB_CMD_EXEC_GEMM_GROUP 26
 #define PTA_TNB_CMD_GET_BATCH_PROFILE 23
-#define PTA_TNB_BATCH_PROFILE_VERSION 4
+#define PTA_TNB_BATCH_PROFILE_VERSION 5
 struct pta_tnb_batch_profile {
     uint32_t version;
     uint32_t counter_frequency;
@@ -473,6 +475,9 @@ struct pta_tnb_batch_profile {
     uint64_t close_mmu_ticks;
     uint64_t close_clear_ticks;
     uint64_t close_restore_ticks;
+    uint64_t config_ticks;
+    uint64_t input_ticks;
+    uint64_t output_ticks;
 
 
 };

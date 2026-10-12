@@ -130,10 +130,13 @@ bool tnb_gemm_emit(uint32_t m, uint32_t k, uint32_t n,
 	if (m < 1 || m > PTA_TNB_GEMM_M_MAX || k < PTA_TNB_GEMM_K_MIN || k > PTA_TNB_GEMM_K_MAX ||
 	    n < PTA_TNB_GEMM_N_MIN || n > PTA_TNB_GEMM_N_MAX ||
 	    k % 32 || n % PTA_TNB_GEMM_N_ALIGN ||
-	    k * n > PTA_TNB_GEMM_B_MAX)
+	    k * n > PTA_TNB_GEMM_B_MAX || m * k > PTA_TNB_GEMM_A_MAX)
 		return false;
 
 	memcpy(out, skeleton, sizeof(skeleton));
+	/* CNA uses a second 32-KiB data bank when the A tile exceeds one bank. */
+	put(out, 0, m * k > 32768 ? 0xa2 : 0xb1);
+	put(out, 15, m * k > 32768 ? 0xa2 : 0xb1);
 	put(out, 6, (m + 1) << 4);
 	put(out, 8, 0x00010000 | m);
 	put(out, 9, ((k - 1) << 16) | k);

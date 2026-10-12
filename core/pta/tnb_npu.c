@@ -15,10 +15,11 @@ void tnb_npu_prepare(vaddr_t base, size_t core, const struct tnb_reg config[TNB_
     io_write32(base + 0x20, interrupt_mask);
     io_write32(base + 0x24, interrupt_mask);
     dsb();
-    for (n = 0; n < TNB_GEMM_WRITES; n++) {
+    /* Device memory preserves the register write order. Complete the entire
+     * configuration before the caller starts any execution unit. */
+    for (n = 0; n < TNB_GEMM_WRITES; n++)
         io_write32(base + config[n].offset, config[n].value);
-        dsb();
-    }
+    dsb();
 }
 
 void tnb_npu_start(vaddr_t base)

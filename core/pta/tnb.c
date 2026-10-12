@@ -80,7 +80,7 @@
 #define TNB_DESC_HI2_MASK GENMASK_64(39, 36)
 #define TNB_TIMEOUT_US 100000
 #define TNB_PAGE_TABLE_COUNT 2
-#define TNB_INPUT_STORAGE_SIZE 57344
+#define TNB_INPUT_STORAGE_SIZE PTA_TNB_GEMM_A_MAX
 #define TNB_OUTPUT_STORAGE_SIZE PTA_TNB_MAX_BATCH_OUTPUT_SIZE
 
 #define TNB_INPUT_REG 0x1070
@@ -111,8 +111,8 @@ struct tnb_registered_weight {
 #define TNB_GENERIC_PLAN_CACHE_COUNT 4u
 struct tnb_generic_plan {
     bool valid;
-    struct pta_tnb_gemm_batch batch;
-    struct tnb_reg config[PTA_TNB_GEMM_MAX_JOBS][TNB_GEMM_WRITES];
+    struct pta_tnb_gemm_batch *batch;
+    struct tnb_reg (*config)[TNB_GEMM_WRITES];
 };
 struct tnb_session {
     struct tnb_generic_plan *plans;
@@ -125,11 +125,8 @@ struct tnb_dev {
 	void *owner;
 	uint32_t generic_count;
 	bool generic_selected;
-	uint32_t generic_b[PTA_TNB_GEMM_MAX_JOBS];
 	uint32_t generic_b_iova[3];
-	uint32_t generic_offset[PTA_TNB_GEMM_MAX_JOBS];
-	struct pta_tnb_gemm generic_gemm[PTA_TNB_GEMM_MAX_JOBS];
-	struct tnb_reg generic_config[PTA_TNB_GEMM_MAX_JOBS][TNB_GEMM_WRITES];
+    const struct tnb_generic_plan *generic_plan;
 	uint32_t state;
 	uint32_t stage;
 	uint32_t fault;
@@ -397,6 +394,7 @@ static void clear_work(void)
     dev.weight_cookie = 0;
     dev.weight_buffer = NULL;
     dev.generic_count = 0;
+    dev.generic_plan = NULL;
     dev.generic_selected = false;
     if (input_clear_size) {
         memset(input_pages, 0, input_clear_size);
@@ -764,6 +762,7 @@ static void capture_failure_npu_debug(void)
 static uint32_t poll_npus(void)
 {
 	uint64_t deadline = timeout_init_us(TNB_TIMEOUT_US);
+	vaddr_t bases[PTA_TNB_MAX_CORES] = { };
 	bool done[PTA_TNB_MAX_CORES] = { false };
 	struct pta_tnb_trace success_trace = {
 		.template_id = dev.template_id,
@@ -774,6 +773,13 @@ static uint32_t poll_npus(void)
 	uint32_t poll_index = 0, last_irq = 0, last_raw = 0;
 	bool have_sample = false;
 
+	for (size_t n = 0; n < dev.core_count; n++) {
+		bases[n] = npu_map(n);
+		if (!bases[n]) {
+			capture_failure_npu_debug();
+			return PTA_TNB_FAULT_NPU;
+		}
+	}
 	while (!timeout_elapsed(deadline)) {
 		size_t n = 0;
 
@@ -783,14 +789,12 @@ static uint32_t poll_npus(void)
 			return PTA_TNB_FAULT_IOMMU;
 		}
 		for (n = 0; n < dev.core_count; n++) {
-			vaddr_t npu = npu_map(n);
+			vaddr_t npu = bases[n];
 			uint32_t status = 0;
 			uint32_t raw = 0;
 
-			if (!npu) {
-				capture_failure_npu_debug();
-				return PTA_TNB_FAULT_NPU;
-			}
+			if (done[n])
+				continue;
 			status = io_read32(npu + NPU_INT_STATUS);
 			raw = io_read32(npu + NPU_INT_RAW_STATUS);
 			if (!n) {
@@ -810,7 +814,7 @@ static uint32_t poll_npus(void)
 			}
 			dev.npu_status |= status;
 			dev.npu_raw_status |= raw;
-			if (!status || done[n])
+			if (!status)
 				continue;
 			if (normalize_status(status) != dev.interrupt_mask[n]) {
 				capture_failure_npu_debug();
@@ -1187,20 +1191,26 @@ static TEE_Result get_registered_plan(struct tnb_session *ctx,
     }
     for (uint32_t i = 0; i < TNB_GENERIC_PLAN_CACHE_COUNT; i++) {
         plan = &ctx->plans[i];
-        if (plan->valid && plan->batch.count == batch->count &&
-            !memcmp(plan->batch.job, batch->job, bytes)) {
+        if (plan->valid && plan->batch->count == batch->count &&
+            !memcmp(plan->batch->job, batch->job, bytes)) {
             *out = plan;
             return TEE_SUCCESS;
         }
     }
     plan = &ctx->plans[ctx->next_plan];
     plan->valid = false;
+    free(plan->batch);
+    free(plan->config);
+    plan->batch = malloc(sizeof(*batch) + bytes);
+    plan->config = malloc((size_t)batch->count * sizeof(*plan->config));
+    if (!plan->batch || !plan->config)
+        return TEE_ERROR_OUT_OF_MEMORY;
+    memcpy(plan->batch, batch, sizeof(*batch) + bytes);
     for (uint32_t i = 0; i < batch->count; i++) {
-        const struct pta_tnb_gemm *g = &batch->job[i].gemm;
+        const struct pta_tnb_gemm *g = &plan->batch->job[i].gemm;
         if (!tnb_gemm_emit(g->m, g->k, g->n, plan->config[i]))
             return TEE_ERROR_BAD_PARAMETERS;
     }
-    plan->batch = *batch;
     plan->valid = true;
     ctx->next_plan = (ctx->next_plan + 1) % TNB_GENERIC_PLAN_CACHE_COUNT;
     *out = plan;
@@ -1214,7 +1224,7 @@ static TEE_Result prepare_registered_batch(void *session, uint32_t types,
 {
     struct tnb_session *ctx = session;
     struct tnb_registered_weight *weights[3] = { };
-    struct pta_tnb_gemm_batch batch = { };
+    const struct pta_tnb_gemm_batch *batch = params[0].memref.buffer;
     struct tnb_generic_plan *plan = NULL;
     TEE_Result res = TEE_ERROR_BAD_PARAMETERS;
     size_t i, n;
@@ -1225,10 +1235,10 @@ static TEE_Result prepare_registered_batch(void *session, uint32_t types,
     if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
             TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_VALUE_INPUT,
             TEE_PARAM_TYPE_VALUE_INPUT) || !params[0].memref.buffer ||
-        params[0].memref.size != sizeof(batch))
+        params[0].memref.size < sizeof(*batch))
         return res;
-    memcpy(&batch, params[0].memref.buffer, sizeof(batch));
-    if (!batch.count || batch.count > PTA_TNB_GEMM_MAX_JOBS || batch.reserved)
+    if (!batch->count || batch->reserved ||
+        params[0].memref.size != sizeof(*batch) + (size_t)batch->count * sizeof(batch->job[0]))
         return res;
     mutex_lock(&lock);
     if (dev.state != PTA_TNB_STATE_READY) {
@@ -1248,8 +1258,8 @@ static TEE_Result prepare_registered_batch(void *session, uint32_t types,
         if (next_iova > BIT64(32))
             goto out;
     }
-    for (i = 0; i < batch.count; i++) {
-        const struct pta_tnb_gemm_job *job = &batch.job[i];
+    for (i = 0; i < batch->count; i++) {
+        const struct pta_tnb_gemm_job *job = &batch->job[i];
         const struct pta_tnb_gemm *g = &job->gemm;
         if (g->abi_version != PTA_TNB_ABI_VERSION ||
             g->mode != PTA_TNB_GEMM_MODE_W8A8 || g->reserved[0] ||
@@ -1258,11 +1268,11 @@ static TEE_Result prepare_registered_batch(void *session, uint32_t types,
             (uint64_t)job->b_offset + (uint64_t)g->k * g->n > weights[job->b_index]->size)
             goto out;
     }
-    res = get_registered_plan(ctx, &batch, &plan);
+    res = get_registered_plan(ctx, batch, &plan);
     if (res)
         goto out;
     tick = profile_now();
-    res = load_generic_gemm(session, &batch.job[0].gemm);
+    res = load_generic_gemm(session, &batch->job[0].gemm);
     batch_profile.setup_ticks += profile_now() - tick;
     if (res)
         goto out;
@@ -1273,14 +1283,8 @@ static TEE_Result prepare_registered_batch(void *session, uint32_t types,
             directory_table[dte_index(b_iova[i]) + n] =
                 make_desc_v2(table_pa + n * TNB_PAGE_SIZE);
     }
-    for (i = 0; i < batch.count; i++) {
-        dev.generic_gemm[i] = batch.job[i].gemm;
-        dev.generic_b[i] = batch.job[i].b_index;
-        dev.generic_offset[i] = batch.job[i].b_offset;
-        memcpy(dev.generic_config[i], plan->config[i],
-               sizeof(dev.generic_config[i]));
-    }
-    dev.generic_count = batch.count;
+    dev.generic_plan = plan;
+    dev.generic_count = batch->count;
     dev.debug[PTA_TNB_DEBUG_PTE_WEIGHT] = weights[0]->pt[0];
     dcache_clean_range(directory_table, sizeof(directory_table));
     dsb();
@@ -1436,6 +1440,7 @@ static TEE_Result run_locked(void *session, TEE_Param *output)
 	TEE_Result res = TEE_SUCCESS;
 	uint64_t profile_start = profile_now();
 	uint64_t poll_start = 0;
+	uint64_t tick = 0;
 	size_t n = 0;
 	bool trace = dev.prepare_flags & PTA_TNB_PREPARE_FLAG_TRACE_STEPS;
 
@@ -1488,6 +1493,7 @@ static TEE_Result run_locked(void *session, TEE_Param *output)
 		capture_address_debug(0);
 	if (trace)
 		capture_config_addresses(npu, PTA_TNB_DEBUG_PRE_CMD_INPUT);
+	tick = profile_now();
 	for (n = 0; n < dev.core_count; n++)
 		if (!prepare_npu_core(n)) {
 			capture_failure_npu_debug();
@@ -1495,6 +1501,7 @@ static TEE_Result run_locked(void *session, TEE_Param *output)
 			res = TEE_ERROR_SECURITY;
 			goto out;
 		}
+	batch_profile.config_ticks += profile_now() - tick;
 	if (dev.prepare_flags & PTA_TNB_PREPARE_FLAG_TRACE_STEPS) {
 		dsb();
 		dev.debug[PTA_TNB_DEBUG_AFTER_CONTROL] =
@@ -1548,7 +1555,9 @@ static TEE_Result run_locked(void *session, TEE_Param *output)
 			capture_config_addresses(npu, PTA_TNB_DEBUG_POST_CMD_INPUT);
 		if (trace)
 			capture_address_debug(2);
+		tick = profile_now();
 		capture_output_debug();
+		batch_profile.output_ticks += profile_now() - tick;
 	}
 	if (dev.fault) {
 		/* Preserve command-written registers before LOCKED resets the NPU. */
@@ -1570,7 +1579,9 @@ static TEE_Result run_locked(void *session, TEE_Param *output)
 		dev.completed_trace.sequence = ++last_success_sequence;
 		last_success_trace = dev.completed_trace;
 	}
+	tick = profile_now();
 	memcpy((*output).memref.buffer, output_pages, dev.output_size);
+	batch_profile.output_ticks += profile_now() - tick;
 	(*output).memref.size = dev.output_size;
 	dev.state = PTA_TNB_STATE_ACTIVE;
 out:
@@ -1590,16 +1601,17 @@ static TEE_Result select_gemm_wave(uint32_t first, uint32_t count, uint32_t m,
     dev.generic_selected = false;
     for (uint32_t core = 0; core < count; core++) {
         uint32_t job = first + core;
-        const struct pta_tnb_gemm *g = &dev.generic_gemm[job];
+        const struct pta_tnb_gemm *g = &dev.generic_plan->batch->job[job].gemm;
         struct tnb_reg *writes = config[core];
 
         if (m == g->m)
-            memcpy(writes, dev.generic_config[job], sizeof(dev.generic_config[job]));
+            memcpy(writes, dev.generic_plan->config[job], sizeof(dev.generic_plan->config[job]));
         else if (!tnb_gemm_emit(m, g->k, g->n, writes))
             return TEE_ERROR_NOT_SUPPORTED;
         writes[TNB_GEMM_A].value = TNB_IOVA_INPUT;
         writes[TNB_GEMM_B].value =
-            dev.generic_b_iova[dev.generic_b[job]] + dev.generic_offset[job];
+            dev.generic_b_iova[dev.generic_plan->batch->job[job].b_index] +
+            dev.generic_plan->batch->job[job].b_offset;
         writes[TNB_GEMM_C].value = TNB_IOVA_OUTPUT + offset;
         dev.interrupt_mask[core] = 0x300;
         offset += (size_t)m * g->n * sizeof(int32_t);
@@ -1609,11 +1621,13 @@ static TEE_Result select_gemm_wave(uint32_t first, uint32_t count, uint32_t m,
     dev.output_size = offset;
     record_generic_work();
     if (stage_input) {
+        uint64_t tick = profile_now();
         memcpy(input_pages, input->memref.buffer, dev.input_size);
         dcache_clean_range(input_pages, dev.input_size);
+        batch_profile.input_ticks += profile_now() - tick;
     }
-    memset(output_pages, 0, output_work_size());
-    dcache_clean_range(output_pages, output_work_size());
+    /* GEMM overwrites every returned C element. CPU writes only at END,
+     * where clear_work() cleans them; completed waves invalidate before read. */
     dev.generic_selected = true;
     dsb();
     return TEE_SUCCESS;
@@ -1634,7 +1648,7 @@ static TEE_Result exec_gemm_group(void *session, uint32_t types,
 
     if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INPUT,
             TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_MEMREF_OUTPUT,
-            TEE_PARAM_TYPE_MEMREF_OUTPUT) || !count || !m ||
+            TEE_PARAM_TYPE_MEMREF_OUTPUT) || !count || count > PTA_TNB_GEMM_GROUP_MAX_JOBS || !m ||
         !result || params[3].memref.size != sizeof(*result) ||
         !buffer_in_area(result, sizeof(*result), CORE_MEM_SEC))
         return TEE_ERROR_BAD_PARAMETERS;
@@ -1652,7 +1666,7 @@ static TEE_Result exec_gemm_group(void *session, uint32_t types,
     }
     /* Complete prevalidation; no device mutation for a malformed group. */
     for (uint32_t i = first; i < first + count; i++) {
-        const struct pta_tnb_gemm *g = &dev.generic_gemm[i];
+        const struct pta_tnb_gemm *g = &dev.generic_plan->batch->job[i].gemm;
         size_t bytes = (size_t)m * g->n * sizeof(int32_t);
         if (m > g->m || params[1].memref.size != (size_t)m * g->k ||
             bytes > params[2].memref.size - total) {
@@ -1673,7 +1687,7 @@ static TEE_Result exec_gemm_group(void *session, uint32_t types,
         size_t bytes = 0;
 
         for (uint32_t n = 0; n < width; n++)
-            bytes += (size_t)m * dev.generic_gemm[i + n].n * sizeof(int32_t);
+            bytes += (size_t)m * dev.generic_plan->batch->job[i + n].gemm.n * sizeof(int32_t);
         result->attempted += width;
         result->phase = PTA_TNB_GROUP_SELECT;
         res = select_gemm_wave(i, width, m, &params[1], i == first);
@@ -1872,6 +1886,12 @@ static void close_session(void *session)
 	if (dev.state != PTA_TNB_STATE_LOCKED)
 		release_registered_weights(tnb_session);
 	mutex_unlock(&lock);
+    if (tnb_session->plans) {
+        for (uint32_t i = 0; i < TNB_GENERIC_PLAN_CACHE_COUNT; i++) {
+            free(tnb_session->plans[i].batch);
+            free(tnb_session->plans[i].config);
+        }
+    }
 	free(tnb_session->plans);
 	memset(tnb_session, 0, sizeof(*tnb_session));
 	free(session);
